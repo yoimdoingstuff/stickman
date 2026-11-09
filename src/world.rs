@@ -48,12 +48,21 @@ pub enum Support {
     /// The top of a box on a web page (text, image, button...) inside a
     /// browser window. `key` identifies the box across page refreshes.
     Ledge { win: WinId, key: u32 },
+    /// The top of a desktop icon (key from its name, so it survives you
+    /// moving the icon around).
+    Icon(u32),
+}
+
+/// A stable key for a desktop icon, from its name.
+pub fn icon_key(name: &str) -> u32 {
+    // FNV-1a.
+    name.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
 }
 
 impl Support {
     pub fn window(self) -> Option<WinId> {
         match self {
-            Support::Floor | Support::Peer(_) | Support::Ledge { .. } => None,
+            Support::Floor | Support::Peer(_) | Support::Ledge { .. } | Support::Icon(_) => None,
             Support::Window(id) | Support::Inside(id) => Some(id),
         }
     }
@@ -178,8 +187,9 @@ impl Layer {
         match support {
             Support::Window(id) | Support::Inside(id) | Support::Ledge { win: id, .. } => Layer::On(id),
             Support::Peer(_) => current,
-            Support::Floor if current == Layer::Behind => Layer::Behind,
-            Support::Floor => Layer::Front,
+            // Icons live on the desktop itself.
+            Support::Floor | Support::Icon(_) if current == Layer::Behind => Layer::Behind,
+            Support::Floor | Support::Icon(_) => Layer::Front,
         }
     }
 }
@@ -197,6 +207,8 @@ pub struct World {
     pub peers: Vec<PeerBody>,
     /// Web pages in browser windows it's near or in.
     pub pages: Vec<Page>,
+    /// Desktop icons: (key, rect). Empty if that's turned off in settings.
+    pub icons: Vec<(u32, Rect)>,
 }
 
 /// Does a taskbar button belong to this window? Button names are either the
@@ -309,11 +321,24 @@ impl World {
         }
     }
 
+    pub fn icon(&self, key: u32) -> Option<Rect> {
+        self.icons.iter().find(|(k, _)| *k == key).map(|(_, r)| *r)
+    }
+
     pub fn surface(&self, support: Support) -> Option<Surface> {
         match support {
             Support::Ledge { win, key } => {
                 let r = self.ledge(win, key, None)?;
                 Some(Surface { support, x0: r.l, x1: r.r, y: r.t, walled: false })
+            }
+            Support::Icon(key) => {
+                // The icon picture's top edge (a little in from the label's sides).
+                let r = self.icon(key)?;
+                let inset = ((r.r - r.l) * 0.15).min(12.0);
+                if r.t < self.work.t + 60.0 {
+                    return None;
+                }
+                Some(Surface { support, x0: r.l + inset, x1: r.r - inset, y: r.t + 2.0, walled: false })
             }
             Support::Floor => Some(Surface {
                 support,
@@ -381,6 +406,9 @@ impl World {
                 out.push(Surface { support, x0: r.l, x1: r.r, y: r.t, walled: false });
             }
         }
+        for (key, _) in &self.icons {
+            out.extend(self.surface(Support::Icon(*key)));
+        }
         out
     }
 
@@ -389,6 +417,7 @@ impl World {
     pub fn support_origin(&self, support: Support, near: Option<Vec2>) -> Option<Vec2> {
         match support {
             Support::Ledge { win, key } => self.ledge(win, key, near.map(|p| p.y)).map(|r| v2(r.l, r.t)),
+            Support::Icon(key) => self.icon(key).map(|r| v2(r.l, r.t)),
             Support::Floor => None,
             Support::Window(id) | Support::Inside(id) => self.window(id).map(|w| v2(w.rect.l, w.rect.t)),
             Support::Peer(id) => self.peers.iter().find(|p| p.id == id).map(|p| v2((p.rect.l + p.rect.r) * 0.5, p.rect.t)),
@@ -403,6 +432,8 @@ impl World {
             // Inside a window (its floor, or boxes on its web page): only if
             // we're in that window already, or jumping there on purpose.
             Support::Inside(id) | Support::Ledge { win: id, .. } => layer == Layer::On(id) || target == Some(s.support),
+            // Icons are on the desktop: not while inside a window.
+            Support::Icon(_) => !matches!(layer, Layer::On(_)) || target == Some(s.support),
             _ => true,
         }
     }
@@ -509,7 +540,12 @@ mod tests {
             doors: Vec::new(),
             peers: Vec::new(),
             pages: vec![Page { win: 7, doc: r(100.0, 180.0, 1100.0, 900.0), ledges: vec![r(200.0, 400.0, 500.0, 440.0)] }],
+            icons: vec![(icon_key("Recycle Bin"), r(20.0, 200.0, 95.0, 270.0))],
         };
+        // Icons are walkable from the desktop, not from inside the browser.
+        let icon = world.surfaces().into_iter().find(|s| matches!(s.support, Support::Icon(_))).expect("icon");
+        assert!(world.can_land(&icon, Layer::Front, None));
+        assert!(!world.can_land(&icon, Layer::On(7), None));
         let ledge = world.surfaces().into_iter().find(|s| matches!(s.support, Support::Ledge { .. })).expect("ledge");
         assert!(world.can_land(&ledge, Layer::On(7), None));
         assert!(!world.can_land(&ledge, Layer::Front, None));

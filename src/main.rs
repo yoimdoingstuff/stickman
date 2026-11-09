@@ -21,11 +21,11 @@ use games::minesweeper::{Helper, Look};
 use games::{Game, GameEvent, Watcher};
 use math::{v2, Rect, Vec2};
 use peers::{Incoming, Me, Peers};
-use platform::{Event, MenuItem};
+use platform::{Event, MenuItem, SettingItem};
 use render::Style;
 use settings::Settings;
 use stickman::{Dims, Mode, Stickman};
-use world::{button_matches, page_ledges, Page, PeerBody, WinId, World};
+use world::{button_matches, icon_key, page_ledges, Page, PeerBody, WinId, World};
 
 /// Fixed physics/animation step.
 const STEP: f32 = 1.0 / 120.0;
@@ -46,7 +46,11 @@ const MENU_CURSOR: u32 = 7;
 const MENU_MS_HELP: u32 = 8;
 const MENU_MS_MISTAKES: u32 = 9;
 const MENU_MS_SNAPSHOT: u32 = 10;
-/// Gravity presets: menu ids MENU_GRAVITY + index.
+const MENU_SETTINGS: u32 = 11;
+const MENU_ICONS: u32 = 12;
+const MENU_WEB: u32 = 13;
+const MENU_FOLDER: u32 = 14;
+/// Gravity dropdown (value = index into GRAVITY_PRESETS).
 const MENU_GRAVITY: u32 = 20;
 const GRAVITY_PRESETS: [(&str, f32); 5] = [
     ("Moon (0.3x)", 0.3),
@@ -76,6 +80,37 @@ fn is_browser(exe: &str) -> bool {
             | "chromium.exe"
             | "iexplore.exe"
     )
+}
+
+/// What the settings panel shows.
+fn settings_items(settings: &Settings, man: &Stickman, paused: bool) -> Vec<SettingItem> {
+    let check = |id: u32, label: &str, on: bool| SettingItem::Check { id, label: label.to_string(), on };
+    let button = |id: u32, label: &str| SettingItem::Button { id, label: label.to_string() };
+    let heading = |t: &str| SettingItem::Heading(t.to_string());
+    let gravity = GRAVITY_PRESETS.iter().position(|(_, g)| (settings.gravity - g).abs() < 0.01).unwrap_or(2);
+    vec![
+        heading("Looks"),
+        button(MENU_COLOR, "Change colour..."),
+        check(MENU_OUTLINE, "Show outline", settings.outline),
+        heading("Behaviour"),
+        check(MENU_FRONT, "Always stay in front of windows", man.force_front),
+        check(MENU_CURSOR, "Can grab my mouse cursor", man.allow_cursor),
+        check(MENU_ICONS, "Play on my desktop icons", settings.desktop_icons),
+        check(MENU_WEB, "Explore web pages in my browser", settings.web_pages),
+        check(MENU_PAUSE, "Pause thinking", paused),
+        SettingItem::Choice {
+            id: MENU_GRAVITY,
+            label: "Gravity".into(),
+            options: GRAVITY_PRESETS.iter().map(|(l, _)| l.to_string()).collect(),
+            selected: gravity,
+        },
+        heading("Games"),
+        check(MENU_MS_HELP, "Help me with Minesweeper", settings.minesweeper_help),
+        check(MENU_MS_MISTAKES, "Let it make mistakes (can lose you the game)", settings.minesweeper_mistakes),
+        button(MENU_MS_SNAPSHOT, "Save Minesweeper snapshot"),
+        heading("Other"),
+        button(MENU_FOLDER, "Open settings folder"),
+    ]
 }
 
 fn look_of(game: Game) -> Look {
@@ -147,10 +182,12 @@ fn main() {
         doors: Vec::new(),
         peers: Vec::new(),
         pages: Vec::new(),
+        icons: Vec::new(),
     };
     // Which windows are web browsers (looked up once per window).
     let mut browsers: std::collections::HashMap<WinId, bool> = std::collections::HashMap::new();
     let mut page_scan = 0.0f32;
+    let mut icon_scan = 0.0f32;
     let mut peers = Peers::new();
     let mut watcher = Watcher::default();
     let mut helper = Helper::new(&mut rng);
@@ -184,113 +221,134 @@ fn main() {
         let frame_start = Instant::now();
 
         for ev in plat.poll_events() {
-            match ev {
+            // A command from the right-click menu (value -1 = toggle) or the
+            // settings panel (value = new checkbox state / dropdown index).
+            let (id, value) = match ev {
                 Event::Quit => break 'run,
                 Event::MouseDown => {
                     man.grab(plat.cursor());
                     brain.notify(BrainEvent::Grabbed);
+                    continue;
                 }
                 Event::MouseUp => {
                     if man.release(&world) {
                         brain.notify(BrainEvent::Thrown);
                     }
+                    continue;
                 }
                 Event::RightClick => {
-                    let gravity_items = GRAVITY_PRESETS
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (label, g))| {
-                            MenuItem::new(MENU_GRAVITY + i as u32, label, (settings.gravity - g).abs() < 0.01)
-                        })
-                        .collect();
-                    let game_items = vec![
-                        MenuItem::new(MENU_MS_HELP, "Help me with Minesweeper", settings.minesweeper_help),
-                        MenuItem::new(MENU_MS_MISTAKES, "Let it make mistakes", settings.minesweeper_mistakes),
-                        MenuItem::separator(),
-                        MenuItem::new(MENU_MS_SNAPSHOT, "Save Minesweeper snapshot (for bug reports)", false),
-                    ];
+                    // Kept short: everything else is in the settings panel.
                     let items = [
                         MenuItem::new(MENU_LIMP, "Ragdoll", false),
                         MenuItem::new(MENU_COME, "Come here", false),
                         MenuItem::separator(),
-                        MenuItem::new(MENU_FRONT, "Stay in front of windows", man.force_front),
-                        MenuItem::new(MENU_CURSOR, "Can grab my cursor", man.allow_cursor),
-                        MenuItem::new(MENU_PAUSE, "Pause thinking", paused),
-                        MenuItem::submenu("Gravity", gravity_items),
-                        MenuItem::submenu("Games", game_items),
-                        MenuItem::separator(),
-                        MenuItem::new(MENU_COLOR, "Change colour...", false),
-                        MenuItem::new(MENU_OUTLINE, "Show outline", settings.outline),
+                        MenuItem::new(MENU_SETTINGS, "Settings...", false),
                         MenuItem::separator(),
                         MenuItem::new(MENU_QUIT, "Quit", false),
                     ];
-                    match plat.show_menu(&items) {
-                        Some(MENU_LIMP) => man.go_limp(),
-                        Some(MENU_COME) => {
-                            let c = plat.cursor();
-                            man.teleport(c - v2(0.0, 40.0 * s));
-                        }
-                        Some(MENU_FRONT) => {
-                            man.force_front = !man.force_front;
-                            settings.stay_in_front = man.force_front;
-                            settings.save();
-                        }
-                        Some(MENU_CURSOR) => {
-                            man.allow_cursor = !man.allow_cursor;
-                            settings.grab_cursor = man.allow_cursor;
-                            settings.save();
-                        }
-                        Some(MENU_PAUSE) => paused = !paused,
-                        Some(MENU_COLOR) => {
-                            if let Some(c) = plat.pick_color(settings.color) {
-                                settings.color = c;
-                                style = Style::new(c, settings.outline);
-                                settings.save();
-                            }
-                        }
-                        Some(MENU_OUTLINE) => {
-                            settings.outline = !settings.outline;
-                            style = Style::new(settings.color, settings.outline);
-                            settings.save();
-                        }
-                        Some(MENU_MS_HELP) => {
-                            settings.minesweeper_help = !settings.minesweeper_help;
-                            settings.save();
-                        }
-                        Some(MENU_MS_MISTAKES) => {
-                            settings.minesweeper_mistakes = !settings.minesweeper_mistakes;
-                            settings.save();
-                        }
-                        Some(MENU_MS_SNAPSHOT) => {
-                            if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
-                                // Saves minesweeper.png + minesweeper.txt, then shows the folder.
-                                let mut ok = true;
-                                match guarded(&mut ok, || helper.snapshot(&mut *plat, id, look_of(game))) {
-                                    Some(Ok(dir)) => {
-                                        let _ = std::process::Command::new("explorer").arg(dir).spawn();
-                                    }
-                                    Some(Err(e)) => eprintln!("stickman: {e}"),
-                                    None => {}
-                                }
-                            }
-                        }
-                        Some(MENU_QUIT) => break 'run,
-                        Some(id) if (MENU_GRAVITY..MENU_GRAVITY + GRAVITY_PRESETS.len() as u32).contains(&id) => {
-                            settings.gravity = GRAVITY_PRESETS[(id - MENU_GRAVITY) as usize].1;
-                            man.gravity = settings.gravity;
-                            settings.save();
-                        }
-                        _ => {}
-                    }
+                    let picked = plat.show_menu(&items);
                     // The menu blocks; don't simulate the time it was open.
                     last = Instant::now();
+                    match picked {
+                        Some(id) => (id, -1),
+                        None => continue,
+                    }
                 }
+                Event::Setting { id, value } => (id, value),
+            };
+            let flag = |current: bool| if value < 0 { !current } else { value != 0 };
+            match id {
+                MENU_LIMP => man.go_limp(),
+                MENU_COME => {
+                    let c = plat.cursor();
+                    man.teleport(c - v2(0.0, 40.0 * s));
+                }
+                MENU_SETTINGS => plat.open_settings(&settings_items(&settings, &man, paused)),
+                MENU_FRONT => {
+                    man.force_front = flag(man.force_front);
+                    settings.stay_in_front = man.force_front;
+                    settings.save();
+                }
+                MENU_CURSOR => {
+                    man.allow_cursor = flag(man.allow_cursor);
+                    settings.grab_cursor = man.allow_cursor;
+                    settings.save();
+                }
+                MENU_ICONS => {
+                    settings.desktop_icons = flag(settings.desktop_icons);
+                    settings.save();
+                }
+                MENU_WEB => {
+                    settings.web_pages = flag(settings.web_pages);
+                    settings.save();
+                }
+                MENU_PAUSE => paused = flag(paused),
+                MENU_COLOR => {
+                    if let Some(c) = plat.pick_color(settings.color) {
+                        settings.color = c;
+                        style = Style::new(c, settings.outline);
+                        settings.save();
+                    }
+                    last = Instant::now();
+                }
+                MENU_OUTLINE => {
+                    settings.outline = flag(settings.outline);
+                    style = Style::new(settings.color, settings.outline);
+                    settings.save();
+                }
+                MENU_MS_HELP => {
+                    settings.minesweeper_help = flag(settings.minesweeper_help);
+                    settings.save();
+                }
+                MENU_MS_MISTAKES => {
+                    settings.minesweeper_mistakes = flag(settings.minesweeper_mistakes);
+                    settings.save();
+                }
+                MENU_MS_SNAPSHOT => {
+                    if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
+                        // Saves minesweeper.png + minesweeper.txt, then shows the folder.
+                        let mut ok = true;
+                        match guarded(&mut ok, || helper.snapshot(&mut *plat, id, look_of(game))) {
+                            Some(Ok(dir)) => {
+                                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                            }
+                            Some(Err(e)) => eprintln!("stickman: {e}"),
+                            None => {}
+                        }
+                    }
+                }
+                MENU_FOLDER => {
+                    if let Some(dir) = crash_log_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    }
+                }
+                MENU_GRAVITY => {
+                    if let Some((_, g)) = GRAVITY_PRESETS.get(value.max(0) as usize) {
+                        settings.gravity = *g;
+                        man.gravity = settings.gravity;
+                        settings.save();
+                    }
+                }
+                MENU_QUIT => break 'run,
+                _ => {}
             }
         }
 
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f32().min(0.1);
         last = now;
+
+        // Desktop icons to climb and swing on (read in the background).
+        if settings.desktop_icons {
+            icon_scan -= dt;
+            if icon_scan <= 0.0 {
+                icon_scan = 2.0;
+                world.icons = plat.desktop_icons().into_iter().map(|(name, r)| (icon_key(&name), r)).collect();
+            }
+        } else {
+            world.icons.clear();
+        }
 
         // Remember where every window was, so moves are never missed (even on
         // the frames where the whole list is re-scanned).
@@ -360,7 +418,9 @@ fn main() {
         // Web pages: the boxes on the page in the browser it's in, and in the
         // browser you're using, become ledges it can stand on.
         page_scan -= dt;
-        if page_scan <= 0.0 {
+        if !settings.web_pages {
+            world.pages.clear();
+        } else if page_scan <= 0.0 {
             page_scan = 0.5;
             browsers.retain(|id, _| world.window(*id).is_some());
             for w in &world.windows {

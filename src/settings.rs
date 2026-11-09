@@ -18,6 +18,10 @@ pub struct Settings {
     /// ...and sometimes pick a risky one (off by default: then it never
     /// makes you lose).
     pub minesweeper_mistakes: bool,
+    /// Climb on and swing from desktop icons.
+    pub desktop_icons: bool,
+    /// Explore the pages in web browsers.
+    pub web_pages: bool,
 }
 
 impl Default for Settings {
@@ -30,6 +34,8 @@ impl Default for Settings {
             gravity: 1.0,
             minesweeper_help: true,
             minesweeper_mistakes: false,
+            desktop_icons: true,
+            web_pages: true,
         }
     }
 }
@@ -71,6 +77,8 @@ impl Settings {
                 "grab_cursor" => s.grab_cursor = flag,
                 "minesweeper_help" => s.minesweeper_help = flag,
                 "minesweeper_mistakes" => s.minesweeper_mistakes = flag,
+                "desktop_icons" => s.desktop_icons = flag,
+                "web_pages" => s.web_pages = flag,
                 "gravity" => {
                     if let Ok(g) = value.trim().parse::<f32>() {
                         s.gravity = g.clamp(0.1, 5.0);
@@ -88,14 +96,16 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\ngravity={}\nminesweeper_help={}\nminesweeper_mistakes={}\n",
+            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\ngravity={}\nminesweeper_help={}\nminesweeper_mistakes={}\ndesktop_icons={}\nweb_pages={}\n",
             to_hex(self.color),
             self.outline,
             self.stay_in_front,
             self.grab_cursor,
             self.gravity,
             self.minesweeper_help,
-            self.minesweeper_mistakes
+            self.minesweeper_mistakes,
+            self.desktop_icons,
+            self.web_pages
         );
         let _ = std::fs::write(p, text);
     }

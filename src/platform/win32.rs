@@ -15,6 +15,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClientRect, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsZoomed,
     SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEMOVE,
 };
+use windows_sys::Win32::Graphics::Gdi::GetStockObject;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AdjustWindowRect, DestroyWindow, FindWindowExW, SendMessageW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -49,7 +54,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::uia::{Element, PageBoxes, Reply, Request, Worker};
-use super::{Event, Image, MenuItem, Platform};
+use super::{Event, Image, MenuItem, Platform, SettingItem};
 use crate::math::{v2, Rect, Vec2};
 use crate::world::{Edge, Taskbar, WinId, WinInfo};
 
@@ -95,6 +100,81 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+// Standard control styles/messages (plain numbers, to avoid depending on
+// exactly how windows-sys types each one).
+const BS_PUSHBUTTON: u32 = 0x0;
+const BS_AUTOCHECKBOX: u32 = 0x3;
+const CBS_DROPDOWNLIST: u32 = 0x3;
+const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETCHECK: u32 = 0x00F1;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_GETCURSEL: u32 = 0x0147;
+const CB_SETCURSEL: u32 = 0x014E;
+const MSG_COMMAND: u32 = 0x0111;
+const MSG_SETFONT: u32 = 0x0030;
+const BN_CLICKED_CODE: u32 = 0;
+const CBN_SELCHANGE_CODE: u32 = 1;
+const DEFAULT_GUI_FONT: i32 = 17;
+/// COLOR_BTNFACE + 1: the usual dialog background.
+const DIALOG_BRUSH: usize = 16;
+
+/// The settings window: turns control changes into `Event::Setting`.
+unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        MSG_COMMAND => {
+            let id = (wp & 0xFFFF) as u32;
+            let code = ((wp >> 16) & 0xFFFF) as u32;
+            let ctrl = lp as HWND;
+            if code == BN_CLICKED_CODE && id != 0 {
+                let on = SendMessageW(ctrl, BM_GETCHECK, 0, 0) == 1;
+                push_event(Event::Setting { id, value: on as i32 });
+            } else if code == CBN_SELCHANGE_CODE {
+                let sel = SendMessageW(ctrl, CB_GETCURSEL, 0, 0);
+                push_event(Event::Setting { id, value: sel as i32 });
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// The window holding the desktop icons ("SysListView32" inside
+/// "SHELLDLL_DefView", which sits under Progman, or under a WorkerW when a
+/// wallpaper slideshow is on).
+unsafe fn desktop_listview() -> HWND {
+    let progman_cls = wide("Progman");
+    let workerw_cls = wide("WorkerW");
+    let defview_cls = wide("SHELLDLL_DefView");
+    let list_cls = wide("SysListView32");
+    let progman = FindWindowW(progman_cls.as_ptr(), null());
+    let mut defview = if progman.is_null() {
+        null_mut()
+    } else {
+        FindWindowExW(progman, null_mut(), defview_cls.as_ptr(), null())
+    };
+    if defview.is_null() {
+        let mut worker: HWND = null_mut();
+        loop {
+            worker = FindWindowExW(null_mut(), worker, workerw_cls.as_ptr(), null());
+            if worker.is_null() {
+                break;
+            }
+            defview = FindWindowExW(worker, null_mut(), defview_cls.as_ptr(), null());
+            if !defview.is_null() {
+                break;
+            }
+        }
+    }
+    if defview.is_null() {
+        return null_mut();
+    }
+    FindWindowExW(defview, null_mut(), list_cls.as_ptr(), null())
+}
+
 unsafe extern "system" fn collect_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let list = &mut *(lparam as *mut Vec<HWND>);
     list.push(hwnd);
@@ -134,6 +214,9 @@ pub struct Win32Platform {
     /// and the latest answers it gave.
     uia: Option<Worker>,
     uia_failed: bool,
+    icons: Vec<(String, Rect)>,
+    settings_hwnd: HWND,
+    settings_class: bool,
     buttons: Vec<(String, Rect)>,
     elements: Vec<(usize, Vec<Element>, std::time::Instant)>,
     pages: Vec<(usize, Option<PageBoxes>, std::time::Instant)>,
@@ -200,6 +283,9 @@ impl Win32Platform {
                 buttons: Vec::new(),
                 elements: Vec::new(),
                 pages: Vec::new(),
+                icons: Vec::new(),
+                settings_hwnd: null_mut(),
+                settings_class: false,
             })
         }
     }
@@ -231,6 +317,7 @@ impl Win32Platform {
                     }
                 }
                 Reply::InvokeFailed(h, at) => clicks.push((h, at)),
+                Reply::Icons(icons) => self.icons = icons,
             }
         }
         // Couldn't press it the accessible way: click it instead.
@@ -512,6 +599,134 @@ impl Platform for Win32Platform {
         match self.uia() {
             Some(w) => w.request(Request::Invoke(id as usize, name_prefix.to_string(), at)),
             None => self.post_click(id, at),
+        }
+    }
+
+    fn desktop_icons(&mut self) -> Vec<(String, Rect)> {
+        let list = unsafe { desktop_listview() };
+        if list.is_null() {
+            return Vec::new();
+        }
+        if let Some(w) = self.uia() {
+            w.request(Request::Icons(list as usize));
+        }
+        self.icons.clone()
+    }
+
+    fn open_settings(&mut self, items: &[SettingItem]) {
+        unsafe {
+            if !self.settings_hwnd.is_null() && IsWindow(self.settings_hwnd) != 0 {
+                DestroyWindow(self.settings_hwnd);
+            }
+            let hinst = GetModuleHandleW(null());
+            let class = wide("StickmanSettings");
+            if !self.settings_class {
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(settings_proc),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: hinst,
+                    hIcon: null_mut(),
+                    hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                    hbrBackground: DIALOG_BRUSH as *mut c_void,
+                    lpszMenuName: null(),
+                    lpszClassName: class.as_ptr(),
+                };
+                RegisterClassW(&wc);
+                self.settings_class = true;
+            }
+
+            // Sizes in "normal DPI" pixels, scaled to this screen.
+            let k = self.dpi_scale();
+            let px = |v: f32| (v * k).round() as i32;
+            let (width, row, pad) = (px(380.0), px(30.0), px(14.0));
+            let client_h = pad * 2 + items.len() as i32 * row;
+            let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+            let mut rc = RECT { left: 0, top: 0, right: width, bottom: client_h };
+            AdjustWindowRect(&mut rc, style, 0);
+            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+            // Open next to where you clicked, kept on screen.
+            let work = self.work_area();
+            let c = self.cursor();
+            let x = ((c.x as i32) - w / 2).clamp(work.l as i32, (work.r as i32 - w).max(work.l as i32));
+            let y = ((c.y as i32) - h / 2).clamp(work.t as i32, (work.b as i32 - h).max(work.t as i32));
+            let title = wide("Stickman settings");
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                style | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                null_mut(),
+                null_mut(),
+                hinst,
+                null(),
+            );
+            if hwnd.is_null() {
+                return;
+            }
+            let font = GetStockObject(DEFAULT_GUI_FONT);
+            let child = |class: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: u32| -> HWND {
+                let cls = wide(class);
+                let txt = wide(text);
+                let c = CreateWindowExW(
+                    0,
+                    cls.as_ptr(),
+                    txt.as_ptr(),
+                    WS_CHILD | WS_VISIBLE | style,
+                    x,
+                    y,
+                    w,
+                    h,
+                    hwnd,
+                    id as usize as HMENU,
+                    hinst,
+                    null(),
+                );
+                SendMessageW(c, MSG_SETFONT, font as usize, 1);
+                c
+            };
+            let mut y = pad;
+            let inner = width - pad * 2;
+            for item in items {
+                match item {
+                    SettingItem::Heading(text) => {
+                        child("STATIC", text, 0, pad, y + px(8), inner, row - px(8), 0);
+                    }
+                    SettingItem::Check { id, label, on } => {
+                        let c = child("BUTTON", label, BS_AUTOCHECKBOX | WS_TABSTOP, pad + px(12), y, inner - px(12), row, *id);
+                        SendMessageW(c, BM_SETCHECK, *on as usize, 0);
+                    }
+                    SettingItem::Choice { id, label, options, selected } => {
+                        child("STATIC", label, 0, pad + px(12), y + px(6), px(140), row - px(6), 0);
+                        let c = child(
+                            "COMBOBOX",
+                            "",
+                            CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+                            pad + px(160),
+                            y + px(2),
+                            inner - px(160),
+                            px(240),
+                            *id,
+                        );
+                        for o in options {
+                            let t = wide(o);
+                            SendMessageW(c, CB_ADDSTRING, 0, t.as_ptr() as LPARAM);
+                        }
+                        SendMessageW(c, CB_SETCURSEL, *selected, 0);
+                    }
+                    SettingItem::Button { id, label } => {
+                        child("BUTTON", label, BS_PUSHBUTTON | WS_TABSTOP, pad + px(12), y + px(2), px(240), row - px(4), *id);
+                    }
+                }
+                y += row;
+            }
+            self.settings_hwnd = hwnd;
+            SetForegroundWindow(hwnd);
         }
     }
 

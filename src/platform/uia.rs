@@ -36,6 +36,8 @@ pub enum Request {
     /// Press the element whose name starts with this, in this window.
     /// If that can't be done, the platform falls back to a click at `at`.
     Invoke(usize, String, Vec2),
+    /// The desktop's icon list window: list the icons.
+    Icons(usize),
 }
 
 pub enum Reply {
@@ -43,18 +45,23 @@ pub enum Reply {
     Elements(usize, Vec<Element>, Instant),
     Page(usize, Option<PageBoxes>, Instant),
     InvokeFailed(usize, Vec2),
+    Icons(Vec<(String, Rect)>),
 }
 
-const KINDS: usize = 3;
+const KINDS: usize = 4;
 
 fn kind_of(r: &Request) -> Option<usize> {
     match r {
         Request::Taskbar(_) => Some(0),
         Request::Elements(_) => Some(1),
         Request::Page(_) => Some(2),
+        Request::Icons(_) => Some(3),
         Request::Invoke(..) => None,
     }
 }
+
+/// UI Automation's "list item" control type (each desktop icon is one).
+const LIST_ITEM: i32 = 50007;
 
 /// The background thread that does the UI Automation work.
 pub struct Worker {
@@ -83,6 +90,13 @@ impl Worker {
                             }
                             Reply::InvokeFailed(h, at)
                         }
+                        Request::Icons(h) => Reply::Icons(
+                            uia.elements(h as *mut c_void)
+                                .into_iter()
+                                .filter(|e| e.2 == LIST_ITEM && e.3.r > e.3.l && e.3.b > e.3.t)
+                                .map(|e| (e.0, e.3))
+                                .collect(),
+                        ),
                     };
                     if replies.send(reply).is_err() {
                         break;
@@ -112,6 +126,7 @@ impl Worker {
             Reply::Taskbar(_) => Some(0),
             Reply::Elements(..) => Some(1),
             Reply::Page(..) => Some(2),
+            Reply::Icons(_) => Some(3),
             Reply::InvokeFailed(..) => None,
         };
         if let Some(k) = k {

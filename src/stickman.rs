@@ -129,6 +129,8 @@ enum JumpKind {
     Flip,
     Cartwheel,
     Cursor { secs: f32 },
+    /// Jump up and grab a fixed point (under a desktop icon) to swing on.
+    Grab { at: Vec2, secs: f32 },
     /// Leap onto a game tile and press it with its feet.
     Stomp { target: Vec2, game: WinId },
     /// Straight up, really high, for no reason.
@@ -167,6 +169,10 @@ pub struct Stickman {
     jump_target: Option<Support>,
     /// Mid-jump toward the cursor, hoping to grab it (seconds to hang).
     chasing_cursor: Option<f32>,
+    /// Mid-jump toward a point to grab and swing on (point, seconds).
+    grab_point: Option<(Vec2, f32)>,
+    /// What it's hanging from: None = the cursor, Some = a fixed bar.
+    hang_point: Option<Vec2>,
     spin: f32,
     spin_rate: f32,
     ragdoll: Option<Ragdoll>,
@@ -256,6 +262,8 @@ impl Stickman {
             pending_climb: None,
             jump_target: None,
             chasing_cursor: None,
+            grab_point: None,
+            hang_point: None,
             spin: 0.0,
             spin_rate: 0.0,
             ragdoll: None,
@@ -661,6 +669,7 @@ impl Stickman {
             | Intent::Flip
             | Intent::Cartwheel
             | Intent::GrabCursor { .. }
+            | Intent::Swing { .. }
             | Intent::Climb { .. }
             | Intent::Portal { .. }
             | Intent::HighLeap
@@ -711,6 +720,12 @@ impl Stickman {
                 Action::JumpPrep { t: 0.2, kind: JumpKind::To { target, support } }
             }
             Intent::Flip => Action::JumpPrep { t: 0.25, kind: JumpKind::Flip },
+            Intent::Swing { at, secs } => {
+                if (at.x - self.pos.x).abs() > 1.0 {
+                    self.facing = (at.x - self.pos.x).signum();
+                }
+                Action::JumpPrep { t: 0.2, kind: JumpKind::Grab { at, secs } }
+            }
             Intent::GrabCursor { secs } => {
                 if (self.cursor.x - self.pos.x).abs() > 1.0 {
                     self.facing = (self.cursor.x - self.pos.x).signum();
@@ -884,6 +899,7 @@ impl Stickman {
         self.pending_climb = None;
         self.jump_target = None;
         self.chasing_cursor = None;
+        self.grab_point = None;
         self.spin = 0.0;
         self.spin_rate = 0.0;
     }
@@ -958,16 +974,28 @@ impl Stickman {
         let time = self.time;
         let cursor = self.cursor;
         let gravity = self.g();
+        let bar = self.hang_point;
         let (vel, settled) = match &mut self.ragdoll {
             None => {
                 self.mode = Mode::Air;
                 return;
             }
             Some(r) => {
-                if held || hanging {
+                if held {
                     r.set_anchor(cursor);
+                } else if hanging {
+                    // Hanging off the cursor, or swinging on an icon.
+                    r.set_anchor(bar.unwrap_or(cursor));
                 }
-                if hanging {
+                if hanging && bar.is_some() {
+                    // Swinging like on a bar: kick the legs in time with the
+                    // swing to make it go higher.
+                    let v = r.velocity();
+                    let pump = if v.x.abs() > 20.0 * s { v.x.signum() } else { self.facing };
+                    for &f in FOOT.iter() {
+                        r.kick(f, v2(pump * 1500.0 * s * dt, 0.0));
+                    }
+                } else if hanging {
                     // Little kicks so it doesn't hang there like a wet towel.
                     for (i, &f) in FOOT.iter().enumerate() {
                         let k = (time * 3.0 + i as f32 * 1.7).sin() * 900.0 * s * dt;
@@ -997,13 +1025,22 @@ impl Stickman {
 
         if hanging {
             self.hang -= dt;
-            let flung = self.cursor_vel.len() > 4500.0 * s;
-            if self.hang <= 0.0 || flung || !self.allow_cursor {
+            let on_cursor = bar.is_none();
+            let flung = on_cursor && self.cursor_vel.len() > 4500.0 * s;
+            if self.hang <= 0.0 || flung || (on_cursor && !self.allow_cursor) {
                 self.hang = 0.0;
+                self.hang_point = None;
                 if let Some(r) = &mut self.ragdoll {
                     r.clear_pins();
                 }
-                if vel.len() < GENTLE * s {
+                if !on_cursor {
+                    // Let go of the bar and fly off it, sometimes with a flip.
+                    self.air_from_ragdoll();
+                    self.vel.y = self.vel.y.min(-200.0 * s);
+                    if self.rng.chance(0.5) && self.vel.x.abs() > 150.0 * s {
+                        self.spin_rate = -self.vel.x.signum() * TAU / 0.7;
+                    }
+                } else if vel.len() < GENTLE * s {
                     self.air_from_ragdoll();
                 }
             }
@@ -1014,14 +1051,18 @@ impl Stickman {
         }
     }
 
-    fn start_hang(&mut self, secs: f32) {
+    /// Grab on with both hands and hang: from the cursor (`bar` None) or from
+    /// a fixed point like the bottom of a desktop icon.
+    fn start_hang(&mut self, secs: f32, bar: Option<Vec2>) {
         self.start_ragdoll(self.vel);
         let s = self.d.s;
+        let at = bar.unwrap_or(self.cursor);
         if let Some(r) = &mut self.ragdoll {
-            r.pin(HAND[0], self.cursor, v2(-2.0 * s, 0.0));
-            r.pin(HAND[1], self.cursor, v2(2.0 * s, 0.0));
+            r.pin(HAND[0], at, v2(-2.0 * s, 0.0));
+            r.pin(HAND[1], at, v2(2.0 * s, 0.0));
         }
         self.hang = secs;
+        self.hang_point = bar;
     }
 
     /// Follow a window we're attached to if it moved.
@@ -1441,6 +1482,20 @@ impl Stickman {
                 self.chasing_cursor = Some(secs);
                 self.jump_target = from;
             }
+            JumpKind::Grab { at, secs } => {
+                // Same idea, aimed at a fixed point (under a desktop icon),
+                // arriving slightly to one side so it starts swinging.
+                let target = at + v2(-self.facing * 6.0 * s, self.d.reach() + self.d.stance);
+                let g = self.g();
+                let up = (foot.y - target.y).max(10.0 * s);
+                let t = (2.0 * up / g).sqrt();
+                self.vel = v2((target.x - foot.x) / t, -(2.0 * g * up).sqrt());
+                self.mode = Mode::Air;
+                self.action = None;
+                self.reset_air_state();
+                self.grab_point = Some((at, secs));
+                self.jump_target = from;
+            }
         }
     }
 
@@ -1604,11 +1659,22 @@ impl Stickman {
         if let Some(secs) = self.chasing_cursor {
             let hands = self.pos - v2(0.0, d.reach());
             if self.allow_cursor && (self.cursor - hands).len() < 26.0 * s {
-                self.start_hang(secs);
+                self.start_hang(secs, None);
                 return None;
             }
             if self.vel.y > 250.0 * s {
                 self.chasing_cursor = None;
+            }
+        }
+        // Jumping at an icon to swing on: catch its bottom edge.
+        if let Some((at, secs)) = self.grab_point {
+            let hands = self.pos - v2(0.0, d.reach());
+            if (at - hands).len() < 28.0 * s {
+                self.start_hang(secs, Some(at));
+                return None;
+            }
+            if self.vel.y > 250.0 * s {
+                self.grab_point = None;
             }
         }
 

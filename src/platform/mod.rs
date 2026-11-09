@@ -10,6 +10,17 @@ pub enum Event {
     MouseUp,
     RightClick,
     Quit,
+    /// Something changed in the settings panel: for a checkbox the new
+    /// state (0/1), for a dropdown the chosen index, for a button 0.
+    Setting { id: u32, value: i32 },
+}
+
+/// One row in the settings panel.
+pub enum SettingItem {
+    Heading(String),
+    Check { id: u32, label: String, on: bool },
+    Choice { id: u32, label: String, options: Vec<String>, selected: usize },
+    Button { id: u32, label: String },
 }
 
 pub struct MenuItem {
@@ -78,6 +89,12 @@ pub trait Platform {
     /// control type), and how old that is in seconds. Background-fetched
     /// like `ui_elements`.
     fn page_boxes(&mut self, id: WinId) -> Option<(Rect, Vec<(Rect, i32)>, f32)>;
+    /// (name, screen rect) of each icon on the desktop. Background-fetched:
+    /// returns the latest list (empty at first).
+    fn desktop_icons(&mut self) -> Vec<(String, Rect)>;
+    /// Open (or re-open, refreshed) the settings window. Changes come back
+    /// as `Event::Setting`.
+    fn open_settings(&mut self, items: &[SettingItem]);
 }
 
 /// Plain RGBA image (not premultiplied; screen captures are opaque).

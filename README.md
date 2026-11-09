@@ -21,8 +21,10 @@ To build locally instead: install Rust (https://rustup.rs) and run
   ragdoll). Throw it hard and it flops; drop it gently and it lands on its feet.
 - **Drop it onto a window** and it lives inside that window, walking along
   its bottom edge until it decides to jump out.
-- **Right-click** it for the menu: ragdoll, come here, stay in front, allow
-  cursor grabbing, pause, change colour, outline on/off, quit.
+- **Right-click** it for a short menu: Ragdoll, Come here, Settings..., Quit.
+  **Settings** opens a panel with everything else: colour, outline, stay in
+  front, cursor grabbing, desktop icons, web pages, pause, gravity, and the
+  game helpers.
 - **Run `stickman.exe` more than once** (up to 16) and the stickmen notice
   each other: they wander over, wave, punch, hold grudges, and knock each
   other over when thrown into one another. They talk over UDP on
@@ -97,6 +99,12 @@ available it falls back to reading the screen. If it isn't helping, use
 and `minesweeper.txt` (what it sees and why it isn't helping) in
 `%APPDATA%\stickman`.
 
+**Desktop icons.** Your desktop icons are ledges too: it jumps onto them,
+walks across them, sits on their edges, and rides along if you drag one.
+It also leaps up, grabs the underside of an icon and swings on it like a
+gymnastics bar, pumping its legs to go higher before launching off (often
+with a flip). Turn it off in Settings if you'd rather it didn't.
+
 **Web pages.** In Chrome, Edge, Firefox, Brave, Opera, Vivaldi and other
 browsers, the boxes on the page you're looking at (text blocks, images,
 buttons, links) become ledges. Once it's inside the browser window (it
@@ -154,8 +162,8 @@ out, so it looks like it's behind them.
 2. Stand on things inside other apps too (Discord, media players), the same
    way as web pages
 3. Stand on cards / tiles in the other classic games
-4. Pick up and carry desktop icons (behind a permission toggle)
-5. Settings/permissions panel
-6. Multi-monitor support
-7. Train a small behavior model in Python, export weights, run inference in Rust
-8. macOS / Linux backends
+4. Push, kick and carry desktop icons around (behind a setting, off by
+   default, since it rearranges your desktop)
+5. Multi-monitor support
+6. Train a small behavior model in Python, export weights, run inference in Rust
+7. macOS / Linux backends

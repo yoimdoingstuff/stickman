@@ -31,6 +31,8 @@ pub enum Intent {
     ToggleLayer,
     /// Jump up, grab the mouse cursor and hang off it for a while.
     GrabCursor { secs: f32 },
+    /// Jump up, grab the bottom of a desktop icon and swing on it.
+    Swing { at: Vec2, secs: f32 },
     Punch { target: u32, dir: f32 },
     /// Tap a (sleeping) stickman to wake it up.
     Poke { target: u32, dir: f32 },
@@ -134,6 +136,7 @@ enum Kind {
     Leap,
     Wake,
     Poke,
+    Swing,
 }
 
 /// Fixed traits, rolled once per stickman. All 0..1.
@@ -306,7 +309,7 @@ impl UtilityBrain {
     fn commit(&mut self, kind: Kind) {
         let n = &mut self.needs;
         match kind {
-            Kind::Jump | Kind::Climb | Kind::Flip | Kind::Enter | Kind::Cursor => {
+            Kind::Jump | Kind::Climb | Kind::Flip | Kind::Enter | Kind::Cursor | Kind::Swing => {
                 n.energy -= 0.1;
                 n.boredom -= 0.35;
             }
@@ -560,7 +563,7 @@ impl Brain for UtilityBrain {
         }
         // Sit on the edge of the window (or page box) we're standing on, legs
         // over the side.
-        if let Support::Window(_) | Support::Ledge { .. } = p.support {
+        if let Support::Window(_) | Support::Ledge { .. } | Support::Icon(_) = p.support {
             let (edge, dir) = if p.hip.x - surf.x0 < surf.x1 - p.hip.x { (surf.x0, -1.0) } else { (surf.x1, 1.0) };
             options.push((
                 Kind::EdgeSit,
@@ -612,7 +615,9 @@ impl Brain for UtilityBrain {
                 let to_game = (if watching.is_some() && t.support.window() == watching { 0.5 } else { 0.0 })
                     + (if on_head { pers.playfulness * 0.3 + pers.mischief * 0.15 } else { 0.0 })
                     // Exploring a web page: hopping from box to box.
-                    + (if matches!(t.support, Support::Ledge { .. }) { 0.15 + pers.curiosity * 0.35 } else { 0.0 });
+                    + (if matches!(t.support, Support::Ledge { .. }) { 0.15 + pers.curiosity * 0.35 } else { 0.0 })
+                    // Playing on the desktop icons.
+                    + (if matches!(t.support, Support::Icon(_)) { 0.1 + pers.playfulness * 0.3 } else { 0.0 });
                 let score = (0.3 + b * 0.5 + pers.playfulness * 0.3 + (rise.max(0.0) / p.max_jump) * pers.curiosity * 0.2) * ef
                     - dx / (3000.0 * s)
                     + to_game
@@ -698,8 +703,29 @@ impl Brain for UtilityBrain {
             }
         }
 
-        // Step off the edge of the window (or page box) we're on.
-        if let Support::Window(_) | Support::Ledge { .. } = p.support {
+        // Swing on a desktop icon like a gymnastics bar: jump up, grab its
+        // bottom edge, swing higher and higher, and launch off.
+        if !inside {
+            let mut best_swing: Option<(Intent, f32)> = None;
+            for (_, r) in &world.icons {
+                let at = v2((r.l + r.r) * 0.5, r.b);
+                let above = p.foot.y - at.y;
+                let dx = (at.x - p.hip.x).abs();
+                if above < p.reach || above > p.max_jump + p.reach || dx > 300.0 * s {
+                    continue;
+                }
+                let score = (0.15 + pers.playfulness * 0.45 + b * 0.2) * ef - dx / (2000.0 * s) + rng.f32() * 0.1;
+                if best_swing.map_or(true, |(_, bs)| score > bs) {
+                    best_swing = Some((Intent::Swing { at, secs: rng.range(2.5, 5.0) }, score));
+                }
+            }
+            if let Some((i, sc)) = best_swing {
+                options.push((Kind::Swing, i, sc));
+            }
+        }
+
+        // Step off the edge of the window (or page box, or icon) we're on.
+        if let Support::Window(_) | Support::Ledge { .. } | Support::Icon(_) = p.support {
             let x = if rng.chance(0.5) { surf.x0 - 12.0 * s } else { surf.x1 + 12.0 * s };
             options.push((Kind::Drop, walk(x), 0.12 + pers.mischief * 0.35 + b * 0.2 - hurt * 0.3));
         }
