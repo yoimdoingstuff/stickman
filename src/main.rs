@@ -25,7 +25,7 @@ use platform::{Event, MenuItem};
 use render::Style;
 use settings::Settings;
 use stickman::{Dims, Mode, Stickman};
-use world::{button_matches, PeerBody, WinId, World};
+use world::{button_matches, page_ledges, Page, PeerBody, WinId, World};
 
 /// Fixed physics/animation step.
 const STEP: f32 = 1.0 / 120.0;
@@ -56,6 +56,27 @@ const GRAVITY_PRESETS: [(&str, f32); 5] = [
     ("Jupiter (2.5x)", 2.5),
 ];
 const MENU_QUIT: u32 = 99;
+
+/// Web browsers whose pages it can explore (they all expose the page's
+/// boxes through UI Automation).
+fn is_browser(exe: &str) -> bool {
+    matches!(
+        exe,
+        "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "brave.exe"
+            | "opera.exe"
+            | "vivaldi.exe"
+            | "librewolf.exe"
+            | "waterfox.exe"
+            | "floorp.exe"
+            | "zen.exe"
+            | "arc.exe"
+            | "chromium.exe"
+            | "iexplore.exe"
+    )
+}
 
 fn look_of(game: Game) -> Look {
     if game == Game::MinesweeperXp {
@@ -125,7 +146,11 @@ fn main() {
         taskbar: plat.taskbar(),
         doors: Vec::new(),
         peers: Vec::new(),
+        pages: Vec::new(),
     };
+    // Which windows are web browsers (looked up once per window).
+    let mut browsers: std::collections::HashMap<WinId, bool> = std::collections::HashMap::new();
+    let mut page_scan = 0.0f32;
     let mut peers = Peers::new();
     let mut watcher = Watcher::default();
     let mut helper = Helper::new(&mut rng);
@@ -331,6 +356,32 @@ fn main() {
         last_cursor = cursor;
         let foreground = plat.foreground();
         let focus_game = foreground.filter(|id| watcher.game_window(*id).is_some());
+
+        // Web pages: the boxes on the page in the browser it's in, and in the
+        // browser you're using, become ledges it can stand on.
+        page_scan -= dt;
+        if page_scan <= 0.0 {
+            page_scan = 0.5;
+            browsers.retain(|id, _| world.window(*id).is_some());
+            for w in &world.windows {
+                browsers
+                    .entry(w.id)
+                    .or_insert_with(|| is_browser(&plat.window_process(w.id).map(|p| p.1).unwrap_or_default()));
+            }
+            let mut wanted: Vec<WinId> = Vec::new();
+            for id in [man.room(), foreground].into_iter().flatten() {
+                if browsers.get(&id) == Some(&true) && !wanted.contains(&id) {
+                    wanted.push(id);
+                }
+            }
+            world.pages = wanted
+                .into_iter()
+                .filter_map(|id| {
+                    let (doc, boxes, age) = plat.page_boxes(id)?;
+                    (age < 10.0).then(|| Page { win: id, doc, ledges: page_ledges(doc, &boxes, s) })
+                })
+                .collect();
+        }
 
         // Other stickmen: share our state, get knocked over (or woken) by theirs.
         let me = Me {

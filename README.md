@@ -89,11 +89,21 @@ stomps it open for you. It only picks tiles the visible numbers *prove* are
 safe, ignores your flags (a wrong one could trick it), and re-checks the
 board right before pressing, so it can't lose the game for you. Turn on
 "Let it make mistakes" (Games menu) if you'd like it to occasionally gamble.
-It reads the board from the screen (and asks the game's accessibility tree
-where the tiles are if that fails). If it isn't helping, use "Save
-Minesweeper snapshot" in the Games menu: it saves `minesweeper.png` and
-`minesweeper.txt` (what it sees and why it isn't helping) in
+It reads the board from the game's accessibility tree (Windows 7
+Minesweeper lists every tile, e.g. "Row 3, Column 5 Tile (Concealed)"), and
+presses tiles through it too, so your mouse isn't touched. If that's not
+available it falls back to reading the screen. If it isn't helping, use
+"Save Minesweeper snapshot" in the Games menu: it saves `minesweeper.png`
+and `minesweeper.txt` (what it sees and why it isn't helping) in
 `%APPDATA%\stickman`.
+
+**Web pages.** In Chrome, Edge, Firefox, Brave, Opera, Vivaldi and other
+browsers, the boxes on the page you're looking at (text blocks, images,
+buttons, links) become ledges. Once it's inside the browser window (it
+likes to dive in through the taskbar to explore, or drop it in yourself) it
+hops from box to box, walks along them, sits on their edges and falls off
+them. The page is re-read about twice a second in the background, so when
+you scroll it gets carried along in little jumps.
 
 **Gravity** can be changed from the right-click menu (Moon to Jupiter).
 Lower gravity also means higher, floatier jumps.
@@ -141,8 +151,8 @@ out, so it looks like it's behind them.
 ## Roadmap
 
 1. ~~Procedural stickman, walking, jumping, climbing, behind-window occlusion~~
-2. Stand on things *inside* windows (message boxes, images, album covers)
-   using Windows UI Automation to find their rectangles
+2. Stand on things inside other apps too (Discord, media players), the same
+   way as web pages
 3. Stand on cards / tiles in the other classic games
 4. Pick up and carry desktop icons (behind a permission toggle)
 5. Settings/permissions panel

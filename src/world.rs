@@ -460,3 +460,59 @@ impl World {
         old
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(l: f32, t: f32, r: f32, b: f32) -> Rect {
+        Rect { l, t, r, b }
+    }
+
+    #[test]
+    fn page_ledges_keep_good_boxes_and_merge_duplicates() {
+        let doc = r(0.0, 100.0, 1000.0, 900.0);
+        let boxes = vec![
+            // A paragraph (group) and the text inside it: one ledge.
+            (r(100.0, 300.0, 600.0, 360.0), 50026),
+            (r(102.0, 301.0, 590.0, 330.0), 50020),
+            // An image further down.
+            (r(200.0, 500.0, 400.0, 650.0), 50006),
+            // Too small, too close to the top, a giant container, and a type
+            // we don't stand on (scroll bar).
+            (r(50.0, 400.0, 70.0, 410.0), 50020),
+            (r(100.0, 120.0, 600.0, 160.0), 50020),
+            (r(0.0, 200.0, 1000.0, 900.0), 50026),
+            (r(980.0, 300.0, 1000.0, 800.0), 50014),
+        ];
+        let ledges = page_ledges(doc, &boxes, 1.0);
+        assert_eq!(ledges.len(), 2, "{ledges:?}");
+        assert!(ledges.iter().any(|l| l.t == 300.0 && l.l == 100.0 && l.r == 600.0));
+        assert!(ledges.iter().any(|l| l.t == 500.0));
+    }
+
+    #[test]
+    fn ledge_keys_survive_scrolling() {
+        // Scrolling only moves boxes up and down.
+        let a = r(100.0, 300.0, 600.0, 360.0);
+        let b = r(100.0, 180.0, 600.0, 240.0);
+        assert_eq!(ledge_key(&a), ledge_key(&b));
+        assert_ne!(ledge_key(&a), ledge_key(&r(140.0, 300.0, 600.0, 360.0)));
+    }
+
+    #[test]
+    fn ledges_only_catch_you_inside_their_window() {
+        let world = World {
+            work: r(0.0, 0.0, 1920.0, 1040.0),
+            windows: vec![WinInfo { id: 7, rect: r(100.0, 100.0, 1100.0, 900.0), maximized: false }],
+            taskbar: None,
+            doors: Vec::new(),
+            peers: Vec::new(),
+            pages: vec![Page { win: 7, doc: r(100.0, 180.0, 1100.0, 900.0), ledges: vec![r(200.0, 400.0, 500.0, 440.0)] }],
+        };
+        let ledge = world.surfaces().into_iter().find(|s| matches!(s.support, Support::Ledge { .. })).expect("ledge");
+        assert!(world.can_land(&ledge, Layer::On(7), None));
+        assert!(!world.can_land(&ledge, Layer::Front, None));
+        assert!(world.surface_near(ledge.support, 410.0).is_some());
+    }
+}

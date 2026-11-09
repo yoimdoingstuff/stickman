@@ -501,7 +501,9 @@ impl Brain for UtilityBrain {
         };
         let walk = |x: f32| Intent::Walk { x, speed: style.speed() * s, style };
         let mut options: Vec<(Kind, Intent, f32)> = Vec::new();
-        let inside = matches!(p.support, Support::Inside(_));
+        // Inside a window: on its floor, or on boxes of the web page in it.
+        let inside = matches!(p.support, Support::Inside(_) | Support::Ledge { .. });
+        let room = if inside { p.support.host() } else { None };
 
         // Idle, with a random fidget (or just looking around).
         let fidget = match (rng.f32() * 7.0) as u32 {
@@ -556,8 +558,9 @@ impl Brain for UtilityBrain {
         if land_x > surf.x0 + 10.0 * s && land_x < surf.x1 - 10.0 * s {
             options.push((Kind::Cartwheel, Intent::Cartwheel, (0.08 + pers.playfulness * 0.3) * ef));
         }
-        // Sit on the edge of the window we're standing on, legs over the side.
-        if let Support::Window(_) = p.support {
+        // Sit on the edge of the window (or page box) we're standing on, legs
+        // over the side.
+        if let Support::Window(_) | Support::Ledge { .. } = p.support {
             let (edge, dir) = if p.hip.x - surf.x0 < surf.x1 - p.hip.x { (surf.x0, -1.0) } else { (surf.x1, 1.0) };
             options.push((
                 Kind::EdgeSit,
@@ -581,13 +584,17 @@ impl Brain for UtilityBrain {
         // Best jump to another surface. Only arcs that don't clip through a
         // window count: otherwise it has to go around (climb, drop, taskbar).
         // Window interiors are reached through the taskbar, not by jumping.
+        // Inside a window it only jumps around inside it (between the boxes
+        // of a web page, and down to the window's floor).
         let foreground = world.windows.first().map(|w| w.id);
-        if !inside {
+        {
             let mut best_jump: Option<(Intent, f32)> = None;
             let skip = world.overlapping(p.foot, s);
             for t in world.surfaces() {
                 let on_head = matches!(t.support, Support::Peer(_));
-                if t.support == p.support || matches!(t.support, Support::Inside(_)) || (t.x1 - t.x0 < 40.0 * s && !on_head) {
+                let in_window = matches!(t.support, Support::Inside(_) | Support::Ledge { .. });
+                let fits = if inside { in_window && t.support.host() == room } else { !in_window };
+                if t.support == p.support || !fits || (t.x1 - t.x0 < 40.0 * s && !on_head) {
                     continue;
                 }
                 // Another stickman's head: aim for the middle (and stack up).
@@ -603,7 +610,9 @@ impl Brain for UtilityBrain {
                     continue;
                 }
                 let to_game = (if watching.is_some() && t.support.window() == watching { 0.5 } else { 0.0 })
-                    + (if on_head { pers.playfulness * 0.3 + pers.mischief * 0.15 } else { 0.0 });
+                    + (if on_head { pers.playfulness * 0.3 + pers.mischief * 0.15 } else { 0.0 })
+                    // Exploring a web page: hopping from box to box.
+                    + (if matches!(t.support, Support::Ledge { .. }) { 0.15 + pers.curiosity * 0.35 } else { 0.0 });
                 let score = (0.3 + b * 0.5 + pers.playfulness * 0.3 + (rise.max(0.0) / p.max_jump) * pers.curiosity * 0.2) * ef
                     - dx / (3000.0 * s)
                     + to_game
@@ -629,7 +638,13 @@ impl Brain for UtilityBrain {
                     let fg = if foreground == Some(w.id) { 0.15 } else { 0.0 };
                     let room = if matches!(target, Support::Inside(_)) { pers.curiosity * 0.15 } else { 0.0 };
                     let to_game = if watching == Some(w.id) { 0.6 } else { 0.0 };
-                    let score = (0.15 + pers.curiosity * 0.35 + b * 0.35 + fg + room) * ef + to_game + rng.f32() * 0.15;
+                    // A web page to explore.
+                    let web = if matches!(target, Support::Inside(_)) && world.pages.iter().any(|pg| pg.win == w.id) {
+                        0.2 + pers.curiosity * 0.3
+                    } else {
+                        0.0
+                    };
+                    let score = (0.15 + pers.curiosity * 0.35 + b * 0.35 + fg + room) * ef + to_game + web + rng.f32() * 0.15;
                     if best_portal.map_or(true, |(_, bs)| score > bs) {
                         best_portal = Some((Intent::Portal { target }, score));
                     }
@@ -683,8 +698,8 @@ impl Brain for UtilityBrain {
             }
         }
 
-        // Step off the edge of the window we're on.
-        if let Support::Window(_) = p.support {
+        // Step off the edge of the window (or page box) we're on.
+        if let Support::Window(_) | Support::Ledge { .. } = p.support {
             let x = if rng.chance(0.5) { surf.x0 - 12.0 * s } else { surf.x1 + 12.0 * s };
             options.push((Kind::Drop, walk(x), 0.12 + pers.mischief * 0.35 + b * 0.2 - hurt * 0.3));
         }
