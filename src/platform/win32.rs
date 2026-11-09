@@ -700,8 +700,8 @@ impl Platform for Win32Platform {
 
             // Sizes in "normal DPI" pixels, scaled to this screen.
             let k = self.dpi_scale();
-            let px = |v: f32| (v * k).round() as i32;
-            let (width, row, pad) = (px(380.0), px(30.0), px(14.0));
+            let px = |v: i32| (v as f32 * k).round() as i32;
+            let (width, row, pad) = (px(380), px(30), px(14));
             let client_h = pad * 2 + items.len() as i32 * row;
             let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
             let mut rc = RECT { left: 0, top: 0, right: width, bottom: client_h };

@@ -298,8 +298,6 @@ fn main() {
     let mut topmost = 0.0f32;
     let mut last_cursor = plat.cursor();
     let mut body_hit_cooldown = 0.0f32;
-    // The Minesweeper the helper is working on.
-    let mut sweeper: Option<(WinId, Look)> = None;
 
     'run: loop {
         let frame_start = Instant::now();
@@ -630,8 +628,8 @@ fn main() {
             }
         }
 
-        // Helping with Minesweeper while you play it.
-        sweeper = None;
+        // Helping with Minesweeper while you play it (the game it's working on).
+        let mut sweeper: Option<(WinId, Look)> = None;
         if settings.minesweeper_help && !paused && games_ok {
             if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
                 if foreground == Some(id) {
