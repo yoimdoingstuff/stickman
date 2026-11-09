@@ -1,0 +1,169 @@
+// No console window in release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod brain;
+mod math;
+mod platform;
+mod render;
+mod rig;
+mod rng;
+mod settings;
+mod stickman;
+mod world;
+
+use std::time::{Duration, Instant};
+
+use brain::{Brain, BrainEvent, Personality, UtilityBrain};
+use math::v2;
+use platform::{Event, MenuItem};
+use render::Style;
+use settings::Settings;
+use stickman::{Dims, Stickman};
+use world::World;
+
+/// Fixed physics/animation step.
+const STEP: f32 = 1.0 / 120.0;
+/// How often to re-scan all windows (the one we're on is polled every frame).
+const WINDOW_SCAN: f32 = 0.15;
+/// Base size multiplier on top of the monitor's DPI scale.
+const SIZE: f32 = 1.15;
+
+const MENU_FRONT: u32 = 1;
+const MENU_PAUSE: u32 = 2;
+const MENU_COME: u32 = 3;
+const MENU_COLOR: u32 = 4;
+const MENU_QUIT: u32 = 99;
+
+fn main() {
+    let mut plat = match platform::create() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("stickman: {e}");
+            return;
+        }
+    };
+    let d = Dims::new(plat.dpi_scale() * SIZE);
+    let mut rng = rng::Rng::seeded();
+    let mut world = World { work: plat.work_area(), windows: plat.windows() };
+
+    let spawn = v2(
+        world.work.l + world.work.width() * rng.range(0.2, 0.8),
+        world.work.t + 80.0 * d.s,
+    );
+    let mut settings = Settings::load();
+    let mut style = Style::from_color(settings.color);
+    let mut man = Stickman::new(d, spawn);
+    man.force_front = settings.stay_in_front;
+    let mut brain = UtilityBrain::new(Personality::random(&mut rng));
+
+    let size = ((190.0 * d.s).ceil() as u32).max(64);
+    let mut pixmap = tiny_skia::Pixmap::new(size, size).expect("pixmap");
+
+    let mut paused = false;
+    let mut last = Instant::now();
+    let mut acc = 0.0f32;
+    let mut scan = 0.0f32;
+    let mut topmost = 0.0f32;
+
+    'run: loop {
+        let frame_start = Instant::now();
+
+        for ev in plat.poll_events() {
+            match ev {
+                Event::Quit => break 'run,
+                Event::MouseDown => {
+                    man.grab(plat.cursor());
+                    brain.notify(BrainEvent::Grabbed);
+                }
+                Event::MouseUp => {
+                    if man.release() {
+                        brain.notify(BrainEvent::Thrown);
+                    }
+                }
+                Event::RightClick => {
+                    let items = [
+                        MenuItem::new(MENU_FRONT, "Stay in front of windows", man.force_front),
+                        MenuItem::new(MENU_PAUSE, "Pause thinking", paused),
+                        MenuItem::new(MENU_COME, "Come here", false),
+                        MenuItem::new(MENU_COLOR, "Change colour...", false),
+                        MenuItem::separator(),
+                        MenuItem::new(MENU_QUIT, "Quit", false),
+                    ];
+                    match plat.show_menu(&items) {
+                        Some(MENU_FRONT) => {
+                            man.force_front = !man.force_front;
+                            settings.stay_in_front = man.force_front;
+                            settings.save();
+                        }
+                        Some(MENU_COLOR) => {
+                            if let Some(c) = plat.pick_color(settings.color) {
+                                settings.color = c;
+                                style = Style::from_color(c);
+                                settings.save();
+                            }
+                        }
+                        Some(MENU_PAUSE) => paused = !paused,
+                        Some(MENU_COME) => {
+                            let c = plat.cursor();
+                            man.teleport(c - v2(0.0, 40.0 * d.s));
+                        }
+                        Some(MENU_QUIT) => break 'run,
+                        _ => {}
+                    }
+                    // The menu blocks; don't simulate the time it was open.
+                    last = Instant::now();
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let dt = now.duration_since(last).as_secs_f32().min(0.1);
+        last = now;
+
+        scan -= dt;
+        if scan <= 0.0 {
+            world.windows = plat.windows();
+            world.work = plat.work_area();
+            scan = WINDOW_SCAN;
+        } else if let Some(id) = man.attached_window() {
+            world.set_window_rect(id, plat.window_rect(id));
+        }
+
+        let cursor = plat.cursor();
+        acc = (acc + dt).min(0.25);
+        while acc >= STEP {
+            acc -= STEP;
+            if !paused && man.wants_intent() {
+                if let Some(p) = man.perceive(cursor) {
+                    let intent = brain.decide(&p, &world, &mut rng);
+                    man.apply(intent);
+                }
+            }
+            brain.tick(STEP);
+            if let Some(impact) = man.update(STEP, &world, cursor) {
+                brain.notify(BrainEvent::Landed(impact));
+            }
+        }
+
+        let origin = v2(
+            (man.pos.x - size as f32 * 0.5).floor(),
+            (man.pos.y - size as f32 * 0.55).floor(),
+        );
+        render::draw(&mut pixmap, &man.rig.pose, origin, &d, &style);
+        let occluders = world.occluders(man.layer);
+        plat.present(pixmap.data(), size, size, origin.x as i32, origin.y as i32, &occluders);
+
+        topmost -= dt;
+        if topmost <= 0.0 {
+            plat.keep_on_top();
+            topmost = 2.0;
+        }
+
+        // ~60 fps while moving, ~30 fps while resting to save CPU.
+        let frame = Duration::from_millis(if man.is_resting() { 33 } else { 16 });
+        let spent = frame_start.elapsed();
+        if spent < frame {
+            std::thread::sleep(frame - spent);
+        }
+    }
+}
