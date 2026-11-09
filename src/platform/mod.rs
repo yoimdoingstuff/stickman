@@ -4,7 +4,7 @@
 use crate::math::{Rect, Vec2};
 use crate::world::{Taskbar, WinId, WinInfo};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
     MouseDown,
     MouseUp,
@@ -13,6 +13,9 @@ pub enum Event {
     /// Something changed in the settings panel: for a checkbox the new
     /// state (0/1), for a dropdown the chosen index, for a button 0.
     Setting { id: u32, value: i32 },
+    /// The mouse wheel turned (anywhere on screen): where the cursor was,
+    /// and how many notches (positive = scrolling up).
+    Wheel { at: Vec2, notches: f32 },
 }
 
 /// One row in the settings panel.
@@ -95,6 +98,11 @@ pub trait Platform {
     /// Open (or re-open, refreshed) the settings window. Changes come back
     /// as `Event::Setting`.
     fn open_settings(&mut self, items: &[SettingItem]);
+    /// Usable area (minus taskbars) of every screen, the main one first.
+    fn screens(&self) -> Vec<Rect>;
+    /// Move desktop icon number `index` (in `desktop_icons` order) so its
+    /// top-left corner is at this screen position.
+    fn move_icon(&mut self, index: usize, to: Vec2);
 }
 
 /// Plain RGBA image (not premultiplied; screen captures are opaque).

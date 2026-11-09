@@ -90,13 +90,7 @@ impl Worker {
                             }
                             Reply::InvokeFailed(h, at)
                         }
-                        Request::Icons(h) => Reply::Icons(
-                            uia.elements(h as *mut c_void)
-                                .into_iter()
-                                .filter(|e| e.2 == LIST_ITEM && e.3.r > e.3.l && e.3.b > e.3.t)
-                                .map(|e| (e.0, e.3))
-                                .collect(),
-                        ),
+                        Request::Icons(h) => Reply::Icons(uia.list_items(h as *mut c_void)),
                     };
                     if replies.send(reply).is_err() {
                         break;
@@ -270,6 +264,32 @@ impl Uia {
         out
     }
 
+    /// The items of a list (the desktop's icons), in their real order, so
+    /// item N here is item N to the list itself (needed to move icons).
+    pub fn list_items(&self, hwnd: *mut c_void) -> Vec<(String, Rect)> {
+        let mut out = Vec::new();
+        if hwnd.is_null() {
+            return out;
+        }
+        unsafe {
+            let Ok(root) = self.auto.ElementFromHandle(HWND(hwnd)) else { return out };
+            let Ok(walker) = self.auto.RawViewWalker() else { return out };
+            let mut child = walker.GetFirstChildElement(&root).ok();
+            while let Some(c) = child {
+                if c.CurrentControlType().map(|t| t.0 == LIST_ITEM).unwrap_or(false) {
+                    let name = c.CurrentName().map(|b| b.to_string()).unwrap_or_default();
+                    let r = c.CurrentBoundingRectangle().map(rect).unwrap_or(Rect { l: 0.0, t: 0.0, r: 0.0, b: 0.0 });
+                    out.push((name, r));
+                }
+                if out.len() > 1000 {
+                    break;
+                }
+                child = walker.GetNextSiblingElement(&c).ok();
+            }
+        }
+        out
+    }
+
     /// Press (UI Automation "Invoke") the first element whose name starts
     /// with `prefix`. Same as clicking it, without touching your mouse.
     pub fn invoke(&self, hwnd: *mut c_void, prefix: &str) -> bool {
@@ -293,8 +313,16 @@ impl Uia {
     /// go (much faster than asking element by element).
     pub fn page(&self, hwnd: *mut c_void) -> Option<PageBoxes> {
         unsafe {
-            // The page itself (the biggest "document" in the window).
-            let (doc, doc_rect) = self.document(hwnd)?;
+            // The page itself (the biggest "document" in the window). Apps
+            // without one (media players, games...) use the whole window.
+            let (doc, doc_rect) = match self.document(hwnd) {
+                Some(d) => d,
+                None => {
+                    let root = self.auto.ElementFromHandle(HWND(hwnd)).ok()?;
+                    let r = rect(root.CurrentBoundingRectangle().ok()?);
+                    (root, r)
+                }
+            };
             let cache = self.auto.CreateCacheRequest().ok()?;
             cache.AddProperty(UIA_BoundingRectanglePropertyId).ok()?;
             cache.AddProperty(UIA_ControlTypePropertyId).ok()?;

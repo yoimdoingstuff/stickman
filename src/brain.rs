@@ -3,6 +3,7 @@
 //! from a weights file) without touching the body or animation code.
 
 use crate::games::{GameEvent, Outcome};
+use crate::learn::{Model, FEATURES};
 use crate::math::*;
 use crate::rig::{Gesture, WalkStyle};
 use crate::rng::Rng;
@@ -76,6 +77,8 @@ pub struct Perception {
     /// A game you're playing right now (it's the window in front).
     pub focus_game: Option<WinId>,
     pub allow_cursor: bool,
+    /// May kick desktop icons around.
+    pub move_icons: bool,
     pub peers: Vec<PeerView>,
 }
 
@@ -97,6 +100,8 @@ pub trait Brain {
     fn notify(&mut self, e: BrainEvent);
     /// A random impulse is about to take over (interrupt what it's doing).
     fn whim_due(&self) -> bool;
+    /// The last choice made and the situation it was made in (for learning).
+    fn take_choice(&mut self) -> Option<(String, [f32; FEATURES])>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +187,11 @@ pub struct UtilityBrain {
     reaction: Option<(Kind, Intent)>,
     /// Seconds until the next random impulse.
     whim_in: f32,
+    /// What it's learned you like (trained from its log), if anything.
+    model: Option<Model>,
+    /// The situation of the decision being made, and the last choice.
+    ctx: [f32; FEATURES],
+    last: Option<(Kind, [f32; FEATURES])>,
 }
 
 impl UtilityBrain {
@@ -195,6 +205,9 @@ impl UtilityBrain {
             fight: None,
             reaction: None,
             whim_in: 12.0,
+            model: Model::load(),
+            ctx: [0.0; FEATURES],
+            last: None,
         }
     }
 
@@ -346,6 +359,7 @@ impl UtilityBrain {
         n.boredom = n.boredom.clamp(0.0, 1.0);
         n.energy = n.energy.clamp(0.0, 1.0);
         self.current = kind;
+        self.last = Some((kind, self.ctx));
         self.history.push(kind);
         if self.history.len() > 6 {
             self.history.remove(0);
@@ -441,6 +455,10 @@ impl Brain for UtilityBrain {
         }
     }
 
+    fn take_choice(&mut self) -> Option<(String, [f32; FEATURES])> {
+        self.last.take().map(|(k, x)| (format!("{k:?}"), x))
+    }
+
     fn whim_due(&self) -> bool {
         // Never in the middle of a fight or a reaction (it used to interrupt
         // every punch mid-swing).
@@ -452,6 +470,23 @@ impl Brain for UtilityBrain {
         let Some(surf) = world.surface_near(p.support, p.foot.y) else {
             return Intent::Idle { secs: 0.5, fidget: Gesture::None };
         };
+        // The situation, for learning what you like (see learn.rs).
+        {
+            let pers = self.personality;
+            let flag = |b: bool| if b { 1.0 } else { 0.0 };
+            self.ctx = [
+                self.needs.boredom,
+                self.needs.energy,
+                pers.curiosity,
+                pers.laziness,
+                pers.mischief,
+                pers.playfulness,
+                p.health,
+                flag(matches!(p.support, Support::Inside(_) | Support::Ledge { .. })),
+                flag((p.cursor - p.hip).len() < 250.0 * p.scale),
+                flag(!p.peers.is_empty()),
+            ];
+        }
         if let Some((kind, intent)) = self.reaction.take() {
             self.commit(kind);
             return intent;
@@ -597,8 +632,16 @@ impl Brain for UtilityBrain {
                 let on_head = matches!(t.support, Support::Peer(_));
                 let in_window = matches!(t.support, Support::Inside(_) | Support::Ledge { .. });
                 let fits = if inside { in_window && t.support.host() == room } else { !in_window };
-                if t.support == p.support || !fits || (t.x1 - t.x0 < 40.0 * s && !on_head) {
+                // Page boxes and icons can be narrow (tiles, cards); windows can't.
+                let min_w = if matches!(t.support, Support::Ledge { .. } | Support::Icon(_)) { 20.0 * s } else { 40.0 * s };
+                if t.support == p.support || !fits || (t.x1 - t.x0 < min_w && !on_head) {
                     continue;
+                }
+                // Only page boxes you can actually see (not scrolled away).
+                if let Support::Ledge { win, .. } = t.support {
+                    if !world.page_visible(win, t.y, s) {
+                        continue;
+                    }
                 }
                 // Another stickman's head: aim for the middle (and stack up).
                 let x = if on_head { (t.x0 + t.x1) * 0.5 } else { rng.range(t.x0 + 15.0 * s, t.x1 - 15.0 * s) };
@@ -701,6 +744,31 @@ impl Brain for UtilityBrain {
             if let Some((i, sc)) = best_climb {
                 options.push((Kind::Climb, i, sc));
             }
+        }
+
+        // Kick a desktop icon at body height across the screen (only if
+        // you've allowed it to move your icons).
+        if p.move_icons && !inside {
+            let mut best_kick: Option<(Kind, Intent, f32)> = None;
+            for (_, r) in &world.icons {
+                if !(r.t < p.foot.y && r.b > p.hip.y - 10.0 * s) {
+                    continue;
+                }
+                let dx = (r.l + r.r) * 0.5 - p.hip.x;
+                let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+                let option = if dx.abs() < 34.0 * s {
+                    (Kind::Kick, Intent::Kick { target: None, dir }, 0.25 + pers.mischief * 0.5)
+                } else if dx.abs() < 400.0 * s && r.l > surf.x0 && r.r < surf.x1 {
+                    let x = (r.l + r.r) * 0.5 - dir * 24.0 * s;
+                    (Kind::Approach, Intent::Walk { x, speed: 140.0 * s, style: WalkStyle::Sneak }, pers.mischief * 0.35)
+                } else {
+                    continue;
+                };
+                if best_kick.as_ref().map_or(true, |b| option.2 > b.2) {
+                    best_kick = Some(option);
+                }
+            }
+            options.extend(best_kick);
         }
 
         // Swing on a desktop icon like a gymnastics bar: jump up, grab its
@@ -837,7 +905,9 @@ impl Brain for UtilityBrain {
             } else {
                 0.0
             };
-            let score = score * 0.6f32.powi(repeats) + watch + rng.f32() * 0.3;
+            // Lean towards what you've reacted to before (if it's learned that).
+            let liked = self.model.as_ref().map_or(0.0, |m| m.bonus(&format!("{kind:?}"), &self.ctx));
+            let score = score * 0.6f32.powi(repeats) + watch + liked + rng.f32() * 0.3;
             if score > best.2 {
                 best = (kind, intent, score);
             }

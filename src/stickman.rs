@@ -147,6 +147,8 @@ pub struct Events {
     pub stomped: bool,
     /// Poked this (sleeping) peer to wake it up.
     pub poke: Option<u32>,
+    /// A kick connected here, in this direction (for kicking desktop icons).
+    pub kicked: Option<(Vec2, f32)>,
 }
 
 pub struct Stickman {
@@ -159,6 +161,8 @@ pub struct Stickman {
     pub layer: Layer,
     pub force_front: bool,
     pub allow_cursor: bool,
+    /// Allowed to kick desktop icons around (a setting, off by default).
+    pub move_icons: bool,
     pub facing: f32,
     time: f32,
     crouch: f32,
@@ -255,6 +259,7 @@ impl Stickman {
             layer: Layer::Front,
             force_front: false,
             allow_cursor: true,
+            move_icons: false,
             facing: 1.0,
             time: 0.0,
             crouch: 0.0,
@@ -335,6 +340,7 @@ impl Stickman {
                 reach: self.d.reach() + self.d.stance,
                 cursor,
                 allow_cursor: self.allow_cursor,
+                move_icons: self.move_icons,
                 peers,
             }),
             _ => None,
@@ -434,6 +440,16 @@ impl Stickman {
     /// The window it's walking around inside, if any.
     pub fn room(&self) -> Option<WinId> {
         self.room
+    }
+
+    /// Up among the boxes of a web page (or flying between them), rather
+    /// than on the window's floor: the page's edges should hide it.
+    pub fn in_page(&self) -> bool {
+        match self.mode {
+            Mode::Ground(Support::Ledge { .. }) => true,
+            Mode::Ground(_) => false,
+            _ => self.room.is_some() || self.ragdoll.as_ref().is_some_and(|r| r.room.is_some()),
+        }
     }
 
     pub fn is_ragdoll(&self) -> bool {
@@ -952,7 +968,7 @@ impl Stickman {
                 best = Some(s);
             }
         }
-        let Some(surf) = best.or_else(|| world.surface(Support::Floor)) else { return };
+        let Some(surf) = best.or_else(|| world.floor_at(hip.x)) else { return };
         self.mode = Mode::Ground(surf.support);
         self.pos = v2(hip.x.clamp(surf.x0 + 2.0, surf.x1 - 2.0), surf.y - self.d.stance);
         self.vel = Vec2::ZERO;
@@ -1160,7 +1176,7 @@ impl Stickman {
             }
             return RigState::Air;
         };
-        if support == Support::Floor {
+        if matches!(support, Support::Floor | Support::Screen(_)) {
             self.carry(world, None);
         } else if !self.ride(world, support, dt) {
             return RigState::Air;
@@ -1234,6 +1250,8 @@ impl Stickman {
                         if let Some(id) = target {
                             ev.hit = Some((id, v2(dir * 950.0, -520.0) * s, 50.0 * s));
                         }
+                        // Where the foot lands, at full stretch.
+                        ev.kicked = Some((self.pos + v2(dir * (d.thigh + d.shin) * 0.9, 0.0), dir));
                     }
                     (t < 0.5).then_some(Action::Kick { t, target, dir, fired })
                 }
@@ -1626,7 +1644,7 @@ impl Stickman {
                 // Don't land on window tops on the way down to the tile.
                 let floor = world.work.b;
                 if foot >= floor {
-                    if let Some(f) = world.surface(Support::Floor) {
+                    if let Some(f) = world.floor_at(self.pos.x) {
                         let impact = self.vel.y;
                         self.land(f, world);
                         return Some(impact);
@@ -1710,7 +1728,7 @@ impl Stickman {
                 }
             }
             if best.is_none() && foot >= w.b {
-                best = world.surface(Support::Floor);
+                best = world.floor_at(self.pos.x);
             }
             if let Some(surf) = best {
                 let impact = self.vel.y;

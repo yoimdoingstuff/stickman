@@ -281,6 +281,8 @@ pub struct Rig {
     /// its hands, or knees up with hands on knees. Picked when it sits down.
     legs_out: bool,
     was_sitting: bool,
+    /// Walk cycle position, 0..1 (one full cycle = two steps).
+    phase: f32,
     pub pose: Pose,
 }
 
@@ -302,6 +304,7 @@ impl Rig {
                 .unwrap_or(0.0),
             legs_out: false,
             was_sitting: false,
+            phase: 0.0,
             pose: Pose::default(),
         }
     }
@@ -327,6 +330,72 @@ impl Rig {
         self.kind = 255;
         self.init = true;
         self.pose = *pose;
+    }
+
+    /// One frame of the walk/run cycle. Each foot spends part of the cycle
+    /// planted (it never slides) and the rest swinging forward in an arc that
+    /// lifts early (knee up) and reaches out late, landing ahead of the hip.
+    /// Returns how far to lower the hips: walking, the body vaults over the
+    /// planted leg like an inverted pendulum (highest mid-step, lowest with
+    /// both feet down); running, it compresses on each landing and floats
+    /// between steps.
+    #[allow(clippy::too_many_arguments)]
+    fn gait_step(&mut self, hip: Vec2, vel_x: f32, ground_y: f32, g: &Gait, d: &Dims, dt: f32, run: f32) -> f32 {
+        let s = d.s;
+        let speed = vel_x.abs().max(1.0);
+        let dir = if vel_x >= 0.0 { 1.0 } else { -1.0 };
+        // Ground covered by one full cycle (two steps): longer when faster.
+        let stride = ((30.0 * s + speed * 0.22) * g.stride).clamp(24.0 * s, 110.0 * s);
+        // Fraction of the cycle each foot is on the ground (walk > half,
+        // run < half, so running has moments with both feet in the air).
+        let duty = 0.62 - 0.27 * run;
+        self.phase = (self.phase + speed * dt / stride).fract();
+        let half = stride * duty * 0.5;
+        let lift_h = (3.0 * s + speed * 0.025) * g.lift * (1.0 + run * 0.6);
+
+        let leg = d.stance + s;
+        let mut pendulum = f32::MAX;
+        let mut compress = 0.0f32;
+        let mut grounded = false;
+        for i in 0..2 {
+            let p = (self.phase + i as f32 * 0.5).fract();
+            let foot = &mut self.feet[i];
+            if p < duty {
+                // Stance: plant where the swing was heading, then stay put.
+                if foot.stepping {
+                    foot.stepping = false;
+                    foot.pos = v2(foot.to.x, ground_y);
+                }
+                foot.pos.y = ground_y;
+                // Fell too far behind (sudden speed-up): take the next step now.
+                if (hip.x - foot.pos.x) * dir > stride * 0.9 {
+                    foot.pos.x = hip.x - dir * stride * 0.5;
+                }
+                let dx = hip.x - foot.pos.x;
+                pendulum = pendulum.min((leg * leg - dx * dx).max(0.0).sqrt());
+                compress = compress.max((PI * p / duty).sin());
+                grounded = true;
+            } else {
+                // Swing.
+                let t = (p - duty) / (1.0 - duty);
+                if !foot.stepping {
+                    foot.stepping = true;
+                    foot.from = foot.pos;
+                }
+                // Land where the hip will be at touchdown, half a stance ahead.
+                let remaining = (1.0 - t) * (1.0 - duty) * stride / speed;
+                foot.to = v2(hip.x + vel_x * remaining + dir * half, ground_y);
+                foot.t = t;
+                foot.dur = ((1.0 - duty) * stride / speed).clamp(0.08, 0.5);
+                foot.lift = v2(0.0, -lift_h);
+                let arc = (PI * t.powf(0.75)).sin();
+                foot.pos = v2(foot.from.x + (foot.to.x - foot.from.x) * smoothstep(t), ground_y - arc * lift_h);
+            }
+            foot.vel = Vec2::ZERO;
+        }
+        let walk_off = if pendulum < f32::MAX { (d.stance - pendulum).clamp(-1.5 * s, 5.0 * s) } else { 0.0 };
+        let run_off = if grounded { 3.0 * s * compress } else { -2.5 * s };
+        (walk_off + (run_off - walk_off) * run) * (1.0 + g.bounce * 0.3)
     }
 
     /// Squash on landing, proportional to how hard we hit.
@@ -410,11 +479,10 @@ impl Rig {
                     + sitk * (d.stance - 2.0 * s)
                     + g.hip * s * (1.0 - sitk)
                     + (if gesture == Gesture::Balance { 2.5 * s } else { 0.0 });
-                let mut bob = -(self.feet[0].lift_amount() + self.feet[1].lift_amount())
-                    * (1.0 + run * 1.5)
-                    * (1.0 + g.bounce)
-                    * s
-                    + (t * 2.1).sin() * 0.4 * s * (1.0 - run);
+                // Bob from stepping (replaced by the proper gait when walking).
+                let step_bob =
+                    -(self.feet[0].lift_amount() + self.feet[1].lift_amount()) * (1.0 + run * 1.5) * (1.0 + g.bounce) * s;
+                let mut bob = step_bob + (t * 2.1).sin() * 0.4 * s * (1.0 - run);
                 if style == WalkStyle::Limp {
                     // Weight drops onto the bad leg (foot 0) while the good one swings.
                     bob += self.feet[1].lift_amount() * 3.5 * s;
@@ -460,6 +528,10 @@ impl Rig {
                     let reach = if legs_out { 27.0 } else { 13.0 };
                     let ideal = [v2(hip.x + f * reach * s, ground_y), v2(hip.x + f * (reach + 2.0) * s, ground_y)];
                     step_pair(&mut self.feet, ideal, Vec2::ZERO, 3.0 * s, 0.2, v2(0.0, -3.0 * s), snap, dt);
+                } else if speed > 15.0 * s && !matches!(gesture, Gesture::TapFoot | Gesture::Kick(_)) {
+                    // Walking / running: the proper gait cycle.
+                    let off = self.gait_step(hip, inp.vel.x, ground_y, &g, d, dt, run);
+                    hip.y += off - step_bob;
                 } else {
                     let moving = speed > 15.0 * s;
                     let base = inp.hip.x + inp.vel.x * 0.1;
@@ -498,7 +570,9 @@ impl Rig {
                 let base_lean = (inp.vel.x / s * 0.0008).clamp(-0.32, 0.32)
                     + f * self.crouch.x * 0.3
                     + f * g.lean * walking
-                    + wobble(t * 0.25, seed + 5.0) * 0.06 * idle_k;
+                    + wobble(t * 0.25, seed + 5.0) * 0.06 * idle_k
+                    // A slight rock forward/back with each step.
+                    + (self.phase * TAU * 2.0).sin() * 0.02 * walking;
                 lean_target = match gesture {
                     Gesture::Sleep => -f * 1.45 * sitk,
                     Gesture::PushUp => f * 1.3 * sitk,

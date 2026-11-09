@@ -15,10 +15,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClientRect, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsZoomed,
     SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEMOVE,
 };
-use windows_sys::Win32::Graphics::Gdi::GetStockObject;
+use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, HMONITOR, MONITORINFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, DestroyWindow, FindWindowExW, SendMessageW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    AdjustWindowRect, CallNextHookEx, DestroyWindow, FindWindowExW, SendMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
@@ -117,6 +118,31 @@ const CBN_SELCHANGE_CODE: u32 = 1;
 const DEFAULT_GUI_FONT: i32 = 17;
 /// COLOR_BTNFACE + 1: the usual dialog background.
 const DIALOG_BRUSH: usize = 16;
+
+const MSG_MOUSEWHEEL: usize = 0x020A;
+const LVM_SETITEMPOSITION: u32 = 0x100F;
+
+/// Low-level mouse hook: only looks at the wheel (so the stickman can react
+/// the instant you scroll a web page). Everything is passed straight on.
+unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 && wp == MSG_MOUSEWHEEL {
+        let info = &*(lp as *const MSLLHOOKSTRUCT);
+        let delta = ((info.mouseData >> 16) & 0xFFFF) as u16 as i16;
+        push_event(Event::Wheel { at: v2(info.pt.x as f32, info.pt.y as f32), notches: delta as f32 / 120.0 });
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+unsafe extern "system" fn collect_monitor(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+    let list = &mut *(data as *mut Vec<(Rect, bool)>);
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(mon, &mut mi) != 0 {
+        let r = mi.rcWork;
+        list.push((Rect { l: r.left as f32, t: r.top as f32, r: r.right as f32, b: r.bottom as f32 }, mi.dwFlags & 1 != 0));
+    }
+    1
+}
 
 /// The settings window: turns control changes into `Event::Setting`.
 unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -217,6 +243,7 @@ pub struct Win32Platform {
     icons: Vec<(String, Rect)>,
     settings_hwnd: HWND,
     settings_class: bool,
+    wheel_hook: HHOOK,
     buttons: Vec<(String, Rect)>,
     elements: Vec<(usize, Vec<Element>, std::time::Instant)>,
     pages: Vec<(usize, Option<PageBoxes>, std::time::Instant)>,
@@ -286,6 +313,7 @@ impl Win32Platform {
                 icons: Vec::new(),
                 settings_hwnd: null_mut(),
                 settings_class: false,
+                wheel_hook: SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0),
             })
         }
     }
@@ -613,6 +641,39 @@ impl Platform for Win32Platform {
         self.icons.clone()
     }
 
+    fn screens(&self) -> Vec<Rect> {
+        let mut list: Vec<(Rect, bool)> = Vec::new();
+        unsafe {
+            EnumDisplayMonitors(null_mut(), null(), Some(collect_monitor), &mut list as *mut Vec<(Rect, bool)> as LPARAM);
+        }
+        // Main screen first.
+        list.sort_by_key(|(_, primary)| !*primary);
+        let mut out: Vec<Rect> = list.into_iter().map(|(r, _)| r).collect();
+        if out.is_empty() {
+            out.push(self.work_area());
+        }
+        out
+    }
+
+    fn move_icon(&mut self, index: usize, to: Vec2) {
+        unsafe {
+            let list = desktop_listview();
+            if list.is_null() {
+                return;
+            }
+            let mut pt = POINT { x: to.x.round() as i32, y: to.y.round() as i32 };
+            ScreenToClient(list, &mut pt);
+            let lp = (((pt.y as u32 & 0xFFFF) << 16) | (pt.x as u32 & 0xFFFF)) as LPARAM;
+            PostMessageW(list, LVM_SETITEMPOSITION, index, lp);
+        }
+        // Update our copy right away, so it doesn't jump back until the next
+        // proper read.
+        if let Some((_, r)) = self.icons.get_mut(index) {
+            let (w, h) = (r.r - r.l, r.b - r.t);
+            *r = Rect { l: to.x, t: to.y, r: to.x + w, b: to.y + h };
+        }
+    }
+
     fn open_settings(&mut self, items: &[SettingItem]) {
         unsafe {
             if !self.settings_hwnd.is_null() && IsWindow(self.settings_hwnd) != 0 {
@@ -891,6 +952,9 @@ impl Drop for Win32Platform {
                 DeleteObject(self.bitmap);
             }
             DeleteDC(self.mem_dc);
+            if !self.wheel_hook.is_null() {
+                UnhookWindowsHookEx(self.wheel_hook);
+            }
         }
     }
 }

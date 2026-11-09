@@ -3,6 +3,7 @@
 
 mod brain;
 mod games;
+mod learn;
 mod math;
 mod peers;
 mod platform;
@@ -50,6 +51,8 @@ const MENU_SETTINGS: u32 = 11;
 const MENU_ICONS: u32 = 12;
 const MENU_WEB: u32 = 13;
 const MENU_FOLDER: u32 = 14;
+const MENU_MOVE_ICONS: u32 = 15;
+const MENU_LEARN: u32 = 16;
 /// Gravity dropdown (value = index into GRAVITY_PRESETS).
 const MENU_GRAVITY: u32 = 20;
 const GRAVITY_PRESETS: [(&str, f32); 5] = [
@@ -61,9 +64,10 @@ const GRAVITY_PRESETS: [(&str, f32); 5] = [
 ];
 const MENU_QUIT: u32 = 99;
 
-/// Web browsers whose pages it can explore (they all expose the page's
-/// boxes through UI Automation).
-fn is_browser(exe: &str) -> bool {
+/// Browsers, and apps built on a browser engine (Discord, Spotify, Slack...),
+/// whose contents it can explore (they all expose their page's boxes
+/// through UI Automation). Other apps work too once it's inside them.
+fn has_web_content(exe: &str) -> bool {
     matches!(
         exe,
         "chrome.exe"
@@ -79,7 +83,71 @@ fn is_browser(exe: &str) -> bool {
             | "arc.exe"
             | "chromium.exe"
             | "iexplore.exe"
+            | "discord.exe"
+            | "spotify.exe"
+            | "slack.exe"
+            | "ms-teams.exe"
+            | "teams.exe"
+            | "whatsapp.exe"
+            | "obsidian.exe"
+            | "notion.exe"
+            | "code.exe"
     )
+}
+
+/// How far one mouse-wheel notch scrolls a page (at 100% scaling).
+fn scroll_step(exe: &str) -> f32 {
+    match exe {
+        "firefox.exe" | "librewolf.exe" | "waterfox.exe" | "floorp.exe" | "zen.exe" => 57.0,
+        _ => 100.0,
+    }
+}
+
+/// A desktop icon flying through the air after being kicked.
+struct IconFlight {
+    index: usize,
+    key: u32,
+    /// Top-left corner.
+    pos: Vec2,
+    vel: Vec2,
+    size: Vec2,
+    age: f32,
+}
+
+impl IconFlight {
+    /// Move it along; false once it has come to rest.
+    fn step(&mut self, dt: f32, g: f32, world: &World) -> bool {
+        self.age += dt;
+        self.vel.y += g * dt;
+        self.pos += self.vel * dt;
+        let w = world.work;
+        if self.pos.x < w.l {
+            self.pos.x = w.l;
+            self.vel.x = self.vel.x.abs() * 0.5;
+        }
+        if self.pos.x + self.size.x > w.r {
+            self.pos.x = w.r - self.size.x;
+            self.vel.x = -self.vel.x.abs() * 0.5;
+        }
+        self.pos.y = self.pos.y.max(w.t);
+        let floor = world.floor_at(self.pos.x + self.size.x * 0.5).map(|f| f.y).unwrap_or(w.b);
+        if self.pos.y + self.size.y > floor {
+            self.pos.y = floor - self.size.y;
+            self.vel.y = -self.vel.y.abs() * 0.3;
+            self.vel.x *= 0.6;
+        }
+        self.age < 4.0 && self.vel.len() > 30.0
+    }
+}
+
+/// The rectangle covering all of these.
+fn union(rects: &[Rect]) -> Rect {
+    rects.iter().fold(rects.first().copied().unwrap_or(Rect { l: 0.0, t: 0.0, r: 1.0, b: 1.0 }), |a, r| Rect {
+        l: a.l.min(r.l),
+        t: a.t.min(r.t),
+        r: a.r.max(r.r),
+        b: a.b.max(r.b),
+    })
 }
 
 /// What the settings panel shows.
@@ -96,7 +164,9 @@ fn settings_items(settings: &Settings, man: &Stickman, paused: bool) -> Vec<Sett
         check(MENU_FRONT, "Always stay in front of windows", man.force_front),
         check(MENU_CURSOR, "Can grab my mouse cursor", man.allow_cursor),
         check(MENU_ICONS, "Play on my desktop icons", settings.desktop_icons),
-        check(MENU_WEB, "Explore web pages in my browser", settings.web_pages),
+        check(MENU_WEB, "Explore web pages and apps", settings.web_pages),
+        check(MENU_MOVE_ICONS, "Can kick my desktop icons around (really moves them)", settings.move_icons),
+        check(MENU_LEARN, "Learn what I like (keeps a log on this PC)", settings.learn),
         check(MENU_PAUSE, "Pause thinking", paused),
         SettingItem::Choice {
             id: MENU_GRAVITY,
@@ -175,8 +245,11 @@ fn main() {
     let d = Dims::new(plat.dpi_scale() * SIZE);
     let s = d.s;
     let mut rng = rng::Rng::seeded();
+    let screens = plat.screens();
     let mut world = World {
-        work: plat.work_area(),
+        work: union(&screens),
+        primary: plat.work_area(),
+        screens,
         windows: plat.windows(),
         taskbar: plat.taskbar(),
         doors: Vec::new(),
@@ -184,9 +257,19 @@ fn main() {
         pages: Vec::new(),
         icons: Vec::new(),
     };
-    // Which windows are web browsers (looked up once per window).
-    let mut browsers: std::collections::HashMap<WinId, bool> = std::collections::HashMap::new();
+    // Each window's program (looked up once per window).
+    let mut exes: std::collections::HashMap<WinId, String> = std::collections::HashMap::new();
     let mut page_scan = 0.0f32;
+    // Page scrolling predicted from the mouse wheel, still to be applied
+    // (px, + = page content moving down), and when the wheel last turned.
+    let mut scroll: std::collections::HashMap<WinId, f32> = std::collections::HashMap::new();
+    // Desktop icons in their real order (index = what Explorer calls them),
+    // and icons currently flying after being kicked.
+    let mut icon_list: Vec<(String, Rect)> = Vec::new();
+    let mut flights: Vec<IconFlight> = Vec::new();
+    // What it did and whether you reacted (only kept with "Learn what I like").
+    let mut logger = learn::Logger::default();
+    let mut last_wheel: std::collections::HashMap<WinId, Instant> = std::collections::HashMap::new();
     let mut icon_scan = 0.0f32;
     let mut peers = Peers::new();
     let mut watcher = Watcher::default();
@@ -201,6 +284,7 @@ fn main() {
     man.force_front = settings.stay_in_front;
     man.allow_cursor = settings.grab_cursor;
     man.gravity = settings.gravity;
+    man.move_icons = settings.move_icons;
     let mut brain = UtilityBrain::new(Personality::random(&mut rng));
 
     let size = ((190.0 * s).ceil() as u32).max(64);
@@ -228,6 +312,7 @@ fn main() {
                 Event::MouseDown => {
                     man.grab(plat.cursor());
                     brain.notify(BrainEvent::Grabbed);
+                    logger.engaged(1.0);
                     continue;
                 }
                 Event::MouseUp => {
@@ -255,6 +340,18 @@ fn main() {
                     }
                 }
                 Event::Setting { id, value } => (id, value),
+                Event::Wheel { at, notches } => {
+                    // Scrolling a page it's on (or near): move the page's
+                    // boxes straight away instead of waiting for a re-read.
+                    if let Some(id) = world.window_at(at) {
+                        if world.pages.iter().any(|p| p.win == id) {
+                            let exe = exes.get(&id).map(String::as_str).unwrap_or("");
+                            *scroll.entry(id).or_insert(0.0) += notches * scroll_step(exe) * plat.dpi_scale();
+                            last_wheel.insert(id, Instant::now());
+                        }
+                    }
+                    continue;
+                }
             };
             let flag = |current: bool| if value < 0 { !current } else { value != 0 };
             match id {
@@ -280,6 +377,15 @@ fn main() {
                 }
                 MENU_WEB => {
                     settings.web_pages = flag(settings.web_pages);
+                    settings.save();
+                }
+                MENU_MOVE_ICONS => {
+                    settings.move_icons = flag(settings.move_icons);
+                    man.move_icons = settings.move_icons;
+                    settings.save();
+                }
+                MENU_LEARN => {
+                    settings.learn = flag(settings.learn);
                     settings.save();
                 }
                 MENU_PAUSE => paused = flag(paused),
@@ -344,7 +450,8 @@ fn main() {
             icon_scan -= dt;
             if icon_scan <= 0.0 {
                 icon_scan = 2.0;
-                world.icons = plat.desktop_icons().into_iter().map(|(name, r)| (icon_key(&name), r)).collect();
+                icon_list = plat.desktop_icons();
+                world.icons = icon_list.iter().map(|(name, r)| (icon_key(name), *r)).collect();
             }
         } else {
             world.icons.clear();
@@ -356,7 +463,9 @@ fn main() {
         scan -= dt;
         if scan <= 0.0 {
             world.windows = plat.windows();
-            world.work = plat.work_area();
+            world.primary = plat.work_area();
+            world.screens = plat.screens();
+            world.work = union(&world.screens);
             world.taskbar = plat.taskbar();
             scan = WINDOW_SCAN;
             // Games opening, being won or lost.
@@ -415,32 +524,65 @@ fn main() {
         let foreground = plat.foreground();
         let focus_game = foreground.filter(|id| watcher.game_window(*id).is_some());
 
-        // Web pages: the boxes on the page in the browser it's in, and in the
-        // browser you're using, become ledges it can stand on.
+        // Pages: the boxes on the web page (or in the app) it's inside, and in
+        // the browser you're using, become ledges it can stand on.
         page_scan -= dt;
         if !settings.web_pages {
             world.pages.clear();
+            scroll.clear();
         } else if page_scan <= 0.0 {
             page_scan = 0.5;
-            browsers.retain(|id, _| world.window(*id).is_some());
+            exes.retain(|id, _| world.window(*id).is_some());
             for w in &world.windows {
-                browsers
-                    .entry(w.id)
-                    .or_insert_with(|| is_browser(&plat.window_process(w.id).map(|p| p.1).unwrap_or_default()));
+                exes.entry(w.id).or_insert_with(|| plat.window_process(w.id).map(|p| p.1).unwrap_or_default());
             }
             let mut wanted: Vec<WinId> = Vec::new();
-            for id in [man.room(), foreground].into_iter().flatten() {
-                if browsers.get(&id) == Some(&true) && !wanted.contains(&id) {
+            // Whatever window it's inside (any app), plus the browser in front.
+            if let Some(id) = man.room() {
+                wanted.push(id);
+            }
+            if let Some(id) = foreground {
+                if exes.get(&id).is_some_and(|e| has_web_content(e)) && !wanted.contains(&id) {
                     wanted.push(id);
                 }
             }
-            world.pages = wanted
-                .into_iter()
-                .filter_map(|id| {
-                    let (doc, boxes, age) = plat.page_boxes(id)?;
-                    (age < 10.0).then(|| Page { win: id, doc, ledges: page_ledges(doc, &boxes, s) })
-                })
-                .collect();
+            let mut pages = Vec::new();
+            for id in wanted {
+                let current = world.pages.iter().find(|p| p.win == id).cloned();
+                let fresh = plat.page_boxes(id).filter(|(_, _, age)| *age < 10.0);
+                let page = match fresh {
+                    Some((doc, boxes, age)) => {
+                        // Read before the scrolling settled? Then it's older
+                        // than what we've predicted: keep the prediction.
+                        let taken = Instant::now().checked_sub(Duration::from_secs_f32(age));
+                        let settled = last_wheel.get(&id).map(|w| *w + Duration::from_millis(400));
+                        let outdated = matches!((taken, settled), (Some(t), Some(w)) if t < w);
+                        if outdated && current.is_some() {
+                            current
+                        } else {
+                            scroll.remove(&id);
+                            Some(Page { win: id, doc, ledges: page_ledges(doc, &boxes, s) })
+                        }
+                    }
+                    None => current,
+                };
+                pages.extend(page);
+            }
+            world.pages = pages;
+        }
+        // Play out predicted scrolling smoothly (like the browser does).
+        for (id, pending) in scroll.iter_mut() {
+            if pending.abs() < 0.1 {
+                continue;
+            }
+            let step = *pending * (1.0 - (-dt * 14.0).exp());
+            *pending -= step;
+            if let Some(page) = world.pages.iter_mut().find(|p| p.win == *id) {
+                for r in &mut page.ledges {
+                    r.t += step;
+                    r.b += step;
+                }
+            }
         }
 
         // Other stickmen: share our state, get knocked over (or woken) by theirs.
@@ -520,6 +662,11 @@ fn main() {
                 if let Some(p) = man.perceive(cursor, views, focus_game) {
                     let intent = brain.decide(&p, &world, &mut rng);
                     man.apply(intent, &world);
+                    if let Some((kind, x)) = brain.take_choice() {
+                        if settings.learn {
+                            logger.chose(kind, x);
+                        }
+                    }
                 }
             }
             brain.tick(STEP);
@@ -531,6 +678,27 @@ fn main() {
                 if let Some(peer) = peers.get(target) {
                     if (peer.hip - man.pos).len() < range {
                         peers.send_hit(target, impulse);
+                    }
+                }
+            }
+            // Kicked a desktop icon: send it flying.
+            if let Some((at, dir)) = ev.kicked {
+                if settings.move_icons && settings.desktop_icons {
+                    let hit = icon_list.iter().position(|(_, r)| {
+                        at.x > r.l - 10.0 * s && at.x < r.r + 10.0 * s && at.y > r.t - 10.0 * s && at.y < r.b + 10.0 * s
+                    });
+                    if let Some(index) = hit {
+                        let (name, r) = &icon_list[index];
+                        if !flights.iter().any(|f| f.index == index) {
+                            flights.push(IconFlight {
+                                index,
+                                key: icon_key(name),
+                                pos: v2(r.l, r.t),
+                                vel: v2(dir * 700.0, -420.0) * s,
+                                size: v2(r.r - r.l, r.b - r.t),
+                                age: 0.0,
+                            });
+                        }
                     }
                 }
             }
@@ -547,6 +715,35 @@ fn main() {
             }
         }
 
+        // Learning: hovering your mouse near it counts as paying attention.
+        if settings.learn {
+            if (cursor - man.center()).len() < 150.0 * s {
+                logger.engaged(dt * 0.6);
+            }
+            logger.tick();
+        }
+
+        // Kicked icons flying across the desktop.
+        let icon_g = stickman::GRAVITY * s * settings.gravity;
+        let mut i = 0;
+        while i < flights.len() {
+            let moving = flights[i].step(dt, icon_g, &world);
+            let (index, key, pos, size) = (flights[i].index, flights[i].key, flights[i].pos, flights[i].size);
+            plat.move_icon(index, pos);
+            let r = Rect { l: pos.x, t: pos.y, r: pos.x + size.x, b: pos.y + size.y };
+            if let Some(entry) = world.icons.iter_mut().find(|(k, _)| *k == key) {
+                entry.1 = r;
+            }
+            if let Some(entry) = icon_list.get_mut(index) {
+                entry.1 = r;
+            }
+            if moving {
+                i += 1;
+            } else {
+                flights.remove(i);
+            }
+        }
+
         let center = man.center();
         let origin = v2((center.x - size as f32 * 0.5).floor(), (center.y - size as f32 * 0.55).floor());
         if man.hidden() {
@@ -559,6 +756,15 @@ fn main() {
         if man.in_portal() {
             if let Some(tb) = world.taskbar {
                 occluders.push(tb.rect);
+            }
+        }
+        // Up on a web page: it's *in* the page, so scrolling it out of view
+        // hides it behind the browser's toolbar (and below the page).
+        if man.in_page() {
+            if let Some(page) = world.pages.iter().find(|p| Some(p.win) == man.room()) {
+                const FAR: f32 = 100_000.0;
+                occluders.push(Rect { l: -FAR, t: -FAR, r: FAR, b: page.doc.t });
+                occluders.push(Rect { l: -FAR, t: page.doc.b, r: FAR, b: FAR });
             }
         }
         plat.present(pixmap.data(), size, size, origin.x as i32, origin.y as i32, &occluders);

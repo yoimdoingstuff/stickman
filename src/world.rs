@@ -51,6 +51,9 @@ pub enum Support {
     /// The top of a desktop icon (key from its name, so it survives you
     /// moving the icon around).
     Icon(u32),
+    /// The bottom of another screen (index into `World::screens`, 1 and up;
+    /// the main screen's bottom is `Floor`).
+    Screen(u8),
 }
 
 /// A stable key for a desktop icon, from its name.
@@ -62,7 +65,7 @@ pub fn icon_key(name: &str) -> u32 {
 impl Support {
     pub fn window(self) -> Option<WinId> {
         match self {
-            Support::Floor | Support::Peer(_) | Support::Ledge { .. } | Support::Icon(_) => None,
+            Support::Floor | Support::Peer(_) | Support::Ledge { .. } | Support::Icon(_) | Support::Screen(_) => None,
             Support::Window(id) | Support::Inside(id) => Some(id),
         }
     }
@@ -97,18 +100,23 @@ pub fn ledge_key(r: &Rect) -> u32 {
 pub fn page_ledges(doc: Rect, boxes: &[(Rect, i32)], s: f32) -> Vec<Rect> {
     // Text, image, button, hyperlink, edit, list item, group, header,
     // menu item, combo box, check box, table, data item.
-    const KINDS: [i32; 13] = [50020, 50006, 50000, 50005, 50004, 50007, 50026, 50034, 50011, 50003, 50002, 50036, 50029];
+    // ... plus "custom" (cards and tiles in some games).
+    const KINDS: [i32; 14] = [50020, 50006, 50000, 50005, 50004, 50007, 50026, 50034, 50011, 50003, 50002, 50036, 50029, 50025];
+    // Boxes scrolled out of view are kept too (a good way past the edges),
+    // so it can be carried off the top of the page and come back.
+    const OFFSCREEN: f32 = 4000.0;
     let doc_area = (doc.r - doc.l) * (doc.b - doc.t);
     let mut ledges: Vec<Rect> = boxes
         .iter()
         .filter(|(_, k)| KINDS.contains(k))
-        .map(|(r, _)| Rect { l: r.l.max(doc.l), t: r.t, r: r.r.min(doc.r), b: r.b.min(doc.b) })
+        .map(|(r, _)| Rect { l: r.l.max(doc.l), t: r.t, r: r.r.min(doc.r), b: r.b })
         .filter(|r| {
             let (w, h) = (r.r - r.l, r.b - r.t);
-            w >= 40.0 * s
+            // Small enough for game tiles and cards, too.
+            w >= 22.0 * s
                 && h >= 10.0 * s
-                && r.t > doc.t + 50.0 * s
-                && r.t < doc.b - 8.0 * s
+                && r.t > doc.t - OFFSCREEN
+                && r.t < doc.b + OFFSCREEN
                 && w * h < doc_area * 0.4
         })
         .collect();
@@ -127,9 +135,12 @@ pub fn page_ledges(doc: Rect, boxes: &[(Rect, i32)], s: f32) -> Vec<Rect> {
             None => out.push(r),
         }
     }
-    // Plenty, but not thousands.
-    out.sort_by(|a, b| (b.r - b.l).partial_cmp(&(a.r - a.l)).unwrap_or(std::cmp::Ordering::Equal));
-    out.truncate(250);
+    // Plenty, but not thousands: the ones in view first, then the widest.
+    let outside = |r: &Rect| (doc.t - r.t).max(r.t - doc.b).max(0.0);
+    out.sort_by(|a, b| {
+        (outside(a), -(a.r - a.l)).partial_cmp(&(outside(b), -(b.r - b.l))).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(300);
     out
 }
 
@@ -188,14 +199,19 @@ impl Layer {
             Support::Window(id) | Support::Inside(id) | Support::Ledge { win: id, .. } => Layer::On(id),
             Support::Peer(_) => current,
             // Icons live on the desktop itself.
-            Support::Floor | Support::Icon(_) if current == Layer::Behind => Layer::Behind,
-            Support::Floor | Support::Icon(_) => Layer::Front,
+            Support::Floor | Support::Icon(_) | Support::Screen(_) if current == Layer::Behind => Layer::Behind,
+            Support::Floor | Support::Icon(_) | Support::Screen(_) => Layer::Front,
         }
     }
 }
 
 pub struct World {
+    /// Everything it can roam: all screens together (minus taskbars).
     pub work: Rect,
+    /// The main screen's usable area (its bottom is the `Floor`).
+    pub primary: Rect,
+    /// Every screen's usable area, the main one first.
+    pub screens: Vec<Rect>,
     /// Windows ordered top-most first.
     pub windows: Vec<WinInfo>,
     /// Visible (not auto-hidden) taskbar, if any.
@@ -342,11 +358,15 @@ impl World {
             }
             Support::Floor => Some(Surface {
                 support,
-                x0: self.work.l,
-                x1: self.work.r,
-                y: self.work.b,
+                x0: self.primary.l,
+                x1: self.primary.r,
+                y: self.primary.b,
                 walled: false,
             }),
+            Support::Screen(i) => {
+                let r = *self.screens.get(i as usize)?;
+                Some(Surface { support, x0: r.l, x1: r.r, y: r.b, walled: false })
+            }
             Support::Window(id) => {
                 let w = self.window(id)?;
                 if w.maximized {
@@ -393,6 +413,9 @@ impl World {
     pub fn surfaces(&self) -> Vec<Surface> {
         let mut out = Vec::with_capacity(self.windows.len() * 2 + 1);
         out.extend(self.surface(Support::Floor));
+        for i in 1..self.screens.len().min(255) {
+            out.extend(self.surface(Support::Screen(i as u8)));
+        }
         for w in &self.windows {
             out.extend(self.surface(Support::Window(w.id)));
             out.extend(self.surface(Support::Inside(w.id)));
@@ -418,7 +441,7 @@ impl World {
         match support {
             Support::Ledge { win, key } => self.ledge(win, key, near.map(|p| p.y)).map(|r| v2(r.l, r.t)),
             Support::Icon(key) => self.icon(key).map(|r| v2(r.l, r.t)),
-            Support::Floor => None,
+            Support::Floor | Support::Screen(_) => None,
             Support::Window(id) | Support::Inside(id) => self.window(id).map(|w| v2(w.rect.l, w.rect.t)),
             Support::Peer(id) => self.peers.iter().find(|p| p.id == id).map(|p| v2((p.rect.l + p.rect.r) * 0.5, p.rect.t)),
         }
@@ -436,6 +459,21 @@ impl World {
             Support::Icon(_) => !matches!(layer, Layer::On(_)) || target == Some(s.support),
             _ => true,
         }
+    }
+
+    /// The screen bottom under `x` (on whichever screen that is).
+    pub fn floor_at(&self, x: f32) -> Option<Surface> {
+        (1..self.screens.len().min(255))
+            .map(|i| Support::Screen(i as u8))
+            .chain(std::iter::once(Support::Floor))
+            .filter_map(|s| self.surface(s))
+            .find(|s| x >= s.x0 && x <= s.x1)
+            .or_else(|| self.surface(Support::Floor))
+    }
+
+    /// Is this height on a web page actually in view (not scrolled away)?
+    pub fn page_visible(&self, win: WinId, y: f32, s: f32) -> bool {
+        self.pages.iter().any(|p| p.win == win && y > p.doc.t + 40.0 * s && y < p.doc.b - 4.0)
     }
 
     /// Top-most window containing a point.
@@ -509,17 +547,22 @@ mod tests {
             (r(102.0, 301.0, 590.0, 330.0), 50020),
             // An image further down.
             (r(200.0, 500.0, 400.0, 650.0), 50006),
-            // Too small, too close to the top, a giant container, and a type
-            // we don't stand on (scroll bar).
+            // Scrolled out of view above the page: kept.
+            (r(100.0, -400.0, 600.0, -360.0), 50020),
+            // Too small, much too far off the page, a giant container, and a
+            // type we don't stand on (scroll bar).
             (r(50.0, 400.0, 70.0, 410.0), 50020),
-            (r(100.0, 120.0, 600.0, 160.0), 50020),
+            (r(100.0, -9000.0, 600.0, -8960.0), 50020),
             (r(0.0, 200.0, 1000.0, 900.0), 50026),
             (r(980.0, 300.0, 1000.0, 800.0), 50014),
         ];
         let ledges = page_ledges(doc, &boxes, 1.0);
-        assert_eq!(ledges.len(), 2, "{ledges:?}");
+        assert_eq!(ledges.len(), 3, "{ledges:?}");
         assert!(ledges.iter().any(|l| l.t == 300.0 && l.l == 100.0 && l.r == 600.0));
         assert!(ledges.iter().any(|l| l.t == 500.0));
+        assert!(ledges.iter().any(|l| l.t == -400.0));
+        // Ones in view come first.
+        assert!(ledges[0].t >= doc.t && ledges[2].t == -400.0);
     }
 
     #[test]
@@ -535,6 +578,8 @@ mod tests {
     fn ledges_only_catch_you_inside_their_window() {
         let world = World {
             work: r(0.0, 0.0, 1920.0, 1040.0),
+            primary: r(0.0, 0.0, 1920.0, 1040.0),
+            screens: vec![r(0.0, 0.0, 1920.0, 1040.0)],
             windows: vec![WinInfo { id: 7, rect: r(100.0, 100.0, 1100.0, 900.0), maximized: false }],
             taskbar: None,
             doors: Vec::new(),

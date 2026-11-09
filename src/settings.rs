@@ -22,6 +22,11 @@ pub struct Settings {
     pub desktop_icons: bool,
     /// Explore the pages in web browsers.
     pub web_pages: bool,
+    /// Kick desktop icons around (this really moves them, so off by default).
+    pub move_icons: bool,
+    /// Keep a log of what it does and whether you reacted, to learn what you
+    /// like (stays on this PC).
+    pub learn: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +41,8 @@ impl Default for Settings {
             minesweeper_mistakes: false,
             desktop_icons: true,
             web_pages: true,
+            move_icons: false,
+            learn: false,
         }
     }
 }
@@ -79,6 +86,8 @@ impl Settings {
                 "minesweeper_mistakes" => s.minesweeper_mistakes = flag,
                 "desktop_icons" => s.desktop_icons = flag,
                 "web_pages" => s.web_pages = flag,
+                "move_icons" => s.move_icons = flag,
+                "learn" => s.learn = flag,
                 "gravity" => {
                     if let Ok(g) = value.trim().parse::<f32>() {
                         s.gravity = g.clamp(0.1, 5.0);
@@ -96,7 +105,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\ngravity={}\nminesweeper_help={}\nminesweeper_mistakes={}\ndesktop_icons={}\nweb_pages={}\n",
+            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\ngravity={}\nminesweeper_help={}\nminesweeper_mistakes={}\ndesktop_icons={}\nweb_pages={}\nmove_icons={}\nlearn={}\n",
             to_hex(self.color),
             self.outline,
             self.stay_in_front,
@@ -105,7 +114,9 @@ impl Settings {
             self.minesweeper_help,
             self.minesweeper_mistakes,
             self.desktop_icons,
-            self.web_pages
+            self.web_pages,
+            self.move_icons,
+            self.learn
         );
         let _ = std::fs::write(p, text);
     }

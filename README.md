@@ -47,6 +47,13 @@ ExplorerPatcher's, on any edge (top-docked taskbars just skip the diving;
 auto-hide is detected). Windows are solid while walking too, and ragdolls
 bounce off them.
 
+**Walking.** A proper gait cycle: each foot is planted (never sliding) for
+part of the cycle and swings forward in an arc the rest of the time, lifting
+the knee early and reaching out to land ahead. Walking, the hips vault over
+the planted leg (highest mid-step, lowest with both feet down); running,
+they compress on each landing and float between steps, and the arms swing
+opposite the legs.
+
 **Walk styles.** Normal, sneaking (tiptoe, hands up), strutting, marching,
 skipping, and a tired shuffle, picked from its mood.
 
@@ -110,8 +117,29 @@ browsers, the boxes on the page you're looking at (text blocks, images,
 buttons, links) become ledges. Once it's inside the browser window (it
 likes to dive in through the taskbar to explore, or drop it in yourself) it
 hops from box to box, walks along them, sits on their edges and falls off
-them. The page is re-read about twice a second in the background, so when
-you scroll it gets carried along in little jumps.
+them. It reacts to scrolling straight away (it watches the mouse wheel, and
+nothing else, over pages): scroll down and it's carried up and off the top,
+into the page, hidden behind the browser's toolbar until you scroll back;
+scroll up fast and the page drops away under it, so it falls down through
+the page onto whatever's below. Other apps work the same way once it's
+inside them: Discord, Spotify, Slack and friends (built on a browser
+engine), and anything else that describes itself to accessibility tools,
+including cards and tiles in some games.
+
+**Kicking icons** (off by default, since it really moves them): with "Can
+kick my desktop icons around" on, it kicks icons it's next to and they fly
+across the screen and bounce to a stop. If Explorer's "Auto arrange icons"
+is on, they snap back.
+
+**Multiple screens.** It roams all your monitors, walking along the bottom
+of each one.
+
+**Learning what you like** (off by default): with "Learn what I like" on,
+it logs each thing it does and whether you reacted (picked it up, hovered
+over it) to `%APPDATA%\stickman\behaviour_log.jsonl`. Run
+`python training/train.py` (needs `pip install numpy`) to train a small
+model from that log; next time it starts, it leans towards the things you
+react to. Nothing leaves your PC.
 
 **Gravity** can be changed from the right-click menu (Moon to Jupiter).
 Lower gravity also means higher, floatier jumps.
@@ -149,6 +177,8 @@ one, so it stays visible on any background.
 | `src/ragdoll.rs` | Verlet ragdoll: joints are particles, bones are distance constraints, with pins for dragging and cursor-hanging. |
 | `src/peers.rs` | Finds other running stickmen over localhost UDP and sends/receives hits. |
 | `src/settings.rs` | Loads/saves the settings file. |
+| `src/learn.rs`, `training/train.py` | Logging what it does and how you react; training and loading the "what you like" model. |
+| `src/games/` | Recognising the classic games, and the Minesweeper helper. |
 | `src/render.rs` | Draws the pose with tiny-skia. |
 | `src/brain.rs` | `Brain` trait + a utility AI with personality and needs (boredom, energy). Meant to be swapped for a small trained model later. |
 
@@ -159,11 +189,12 @@ out, so it looks like it's behind them.
 ## Roadmap
 
 1. ~~Procedural stickman, walking, jumping, climbing, behind-window occlusion~~
-2. Stand on things inside other apps too (Discord, media players), the same
-   way as web pages
-3. Stand on cards / tiles in the other classic games
-4. Push, kick and carry desktop icons around (behind a setting, off by
-   default, since it rearranges your desktop)
-5. Multi-monitor support
-6. Train a small behavior model in Python, export weights, run inference in Rust
-7. macOS / Linux backends
+2. ~~Stand on things inside other apps too (Discord, media players)~~
+3. ~~Stand on cards / tiles in the other classic games~~ (where the game
+   exposes them to accessibility tools)
+4. ~~Kick desktop icons around (opt-in)~~; picking them up and carrying them
+5. ~~Multi-monitor support~~
+6. ~~Learn from you: log, Python trainer, model loaded in Rust~~
+7. macOS / Linux backends (everything OS-specific is behind the `Platform`
+   trait in `src/platform/`, so a backend is "only" that file's worth of
+   window, overlay and accessibility code per OS)
