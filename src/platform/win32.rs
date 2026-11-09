@@ -92,7 +92,7 @@ unsafe fn frame_rect(h: HWND) -> Option<Rect> {
     let mut rc: RECT = zeroed();
     let hr = DwmGetWindowAttribute(
         h,
-        DWMWA_EXTENDED_FRAME_BOUNDS,
+        DWMWA_EXTENDED_FRAME_BOUNDS as u32,
         &mut rc as *mut RECT as *mut c_void,
         size_of::<RECT>() as u32,
     );
@@ -208,7 +208,7 @@ impl Win32Platform {
         let mut cloaked: u32 = 0;
         DwmGetWindowAttribute(
             h,
-            DWMWA_CLOAKED,
+            DWMWA_CLOAKED as u32,
             &mut cloaked as *mut u32 as *mut c_void,
             size_of::<u32>() as u32,
         );
