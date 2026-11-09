@@ -43,15 +43,26 @@ pub enum Support {
     Window(WinId),
     /// The bottom edge, *inside* a window (walking around in it).
     Inside(WinId),
+    /// On top of another stickman (from another stickman.exe).
+    Peer(u32),
 }
 
 impl Support {
     pub fn window(self) -> Option<WinId> {
         match self {
-            Support::Floor => None,
+            Support::Floor | Support::Peer(_) => None,
             Support::Window(id) | Support::Inside(id) => Some(id),
         }
     }
+}
+
+/// Another stickman's body, for standing on and bumping into.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerBody {
+    pub id: u32,
+    /// Bounding box of its body.
+    pub rect: Rect,
+    pub ragdoll: bool,
 }
 
 /// A horizontal line you can stand on.
@@ -98,6 +109,7 @@ impl Layer {
     pub fn for_support(support: Support, current: Layer) -> Layer {
         match support {
             Support::Window(id) | Support::Inside(id) => Layer::On(id),
+            Support::Peer(_) => current,
             Support::Floor if current == Layer::Behind => Layer::Behind,
             Support::Floor => Layer::Front,
         }
@@ -113,6 +125,8 @@ pub struct World {
     /// Windows that have a matching app button on the taskbar, and where
     /// that button is: the only places it will dive into the taskbar.
     pub doors: Vec<(WinId, Rect)>,
+    /// Other stickmen's bodies.
+    pub peers: Vec<PeerBody>,
 }
 
 /// Does a taskbar button belong to this window? Button names are either the
@@ -219,6 +233,21 @@ impl World {
                 }
                 Some(Surface { support, x0, x1, y: r.t, walled: false })
             }
+            Support::Peer(id) => {
+                // Standing on someone's head (or on top of a ragdoll pile).
+                let p = self.peers.iter().find(|p| p.id == id)?;
+                let r = p.rect;
+                let (x0, x1) = if p.ragdoll {
+                    (r.l, r.r)
+                } else {
+                    let c = (r.l + r.r) * 0.5;
+                    (c - 6.0, c + 6.0)
+                };
+                if r.t < self.work.t + 60.0 {
+                    return None;
+                }
+                Some(Surface { support, x0, x1, y: r.t, walled: false })
+            }
             Support::Inside(id) => {
                 let r = self.window(id)?.rect;
                 let x0 = r.l.max(self.work.l) + 6.0;
@@ -240,7 +269,19 @@ impl World {
             out.extend(self.surface(Support::Window(w.id)));
             out.extend(self.surface(Support::Inside(w.id)));
         }
+        for p in &self.peers {
+            out.extend(self.surface(Support::Peer(p.id)));
+        }
         out
+    }
+
+    /// The point a support moves with (so we can ride along when it moves).
+    pub fn support_origin(&self, support: Support) -> Option<Vec2> {
+        match support {
+            Support::Floor => None,
+            Support::Window(id) | Support::Inside(id) => self.window(id).map(|w| v2(w.rect.l, w.rect.t)),
+            Support::Peer(id) => self.peers.iter().find(|p| p.id == id).map(|p| v2((p.rect.l + p.rect.r) * 0.5, p.rect.t)),
+        }
     }
 
     /// Window interiors only catch you if you're already in that window's

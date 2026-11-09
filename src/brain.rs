@@ -32,6 +32,17 @@ pub enum Intent {
     /// Jump up, grab the mouse cursor and hang off it for a while.
     GrabCursor { secs: f32 },
     Punch { target: u32, dir: f32 },
+    /// Tap a (sleeping) stickman to wake it up.
+    Poke { target: u32, dir: f32 },
+    /// Random silliness.
+    Trip,
+    Tantrum,
+    PlayDead { secs: f32 },
+    /// Run off this side of the screen and come back in the other.
+    Wrap { dir: f32 },
+    Spin { secs: f32 },
+    Slide,
+    HighLeap,
 }
 
 /// Another stickman (from another stickman.exe).
@@ -40,6 +51,9 @@ pub struct PeerView {
     pub id: u32,
     pub hip: Vec2,
     pub ragdoll: bool,
+    pub sleeping: bool,
+    /// Bottom of its body (where it's standing or lying).
+    pub ground: f32,
 }
 
 /// What the brain gets to see when making a decision.
@@ -71,12 +85,16 @@ pub enum BrainEvent {
     Hit { from: u32 },
     /// Something happened in a game you're playing.
     Game(GameEvent),
+    /// Another stickman poked us while we were asleep.
+    Poked { from: u32 },
 }
 
 pub trait Brain {
     fn tick(&mut self, dt: f32);
     fn decide(&mut self, p: &Perception, world: &World, rng: &mut Rng) -> Intent;
     fn notify(&mut self, e: BrainEvent);
+    /// A random impulse is about to take over (interrupt what it's doing).
+    fn whim_due(&self) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +122,18 @@ enum Kind {
     Meditate,
     EdgeSit,
     Cartwheel,
+    Moonwalk,
+    Sprint,
+    Trip,
+    Tantrum,
+    PlayDead,
+    Wrap,
+    Spin,
+    Panic,
+    Slide,
+    Leap,
+    Wake,
+    Poke,
 }
 
 /// Fixed traits, rolled once per stickman. All 0..1.
@@ -147,6 +177,8 @@ pub struct UtilityBrain {
     fight: Option<(u32, f32)>,
     /// A reaction to do next, whatever else it wanted (cheering a win...).
     reaction: Option<(Kind, Intent)>,
+    /// Seconds until the next random impulse.
+    whim_in: f32,
 }
 
 impl UtilityBrain {
@@ -159,7 +191,48 @@ impl UtilityBrain {
             grudge: None,
             fight: None,
             reaction: None,
+            whim_in: 12.0,
         }
+    }
+
+    /// Something random and silly, out of nowhere.
+    fn whim(&mut self, p: &Perception, surf: &Surface, rng: &mut Rng) -> (Kind, Intent) {
+        let s = p.scale;
+        let margin = 14.0 * s;
+        let wide = surf.x1 - surf.x0 > margin * 3.0;
+        let random_x = if wide { rng.range(surf.x0 + margin, surf.x1 - margin) } else { p.hip.x };
+        let far = if p.hip.x - surf.x0 > surf.x1 - p.hip.x { surf.x0 + margin } else { surf.x1 - margin };
+        let away = if p.cursor.x < p.hip.x { surf.x1 - margin } else { surf.x0 + margin };
+        let mut picks: Vec<(Kind, Intent)> = vec![
+            (Kind::Trip, Intent::Trip),
+            (Kind::Tantrum, Intent::Tantrum),
+            (Kind::PlayDead, Intent::PlayDead { secs: rng.range(5.0, 12.0) }),
+            (Kind::Spin, Intent::Spin { secs: rng.range(1.0, 2.5) }),
+        ];
+        if p.health >= 0.5 {
+            let walk = |x: f32, style: WalkStyle, speed: f32| Intent::Walk { x, speed: speed * s, style };
+            picks.extend([
+                (Kind::Moonwalk, walk(random_x, WalkStyle::Moonwalk, WalkStyle::Moonwalk.speed())),
+                (Kind::Sprint, walk(far, WalkStyle::Normal, 460.0)),
+                (Kind::Panic, walk(away, WalkStyle::Panic, WalkStyle::Panic.speed())),
+                (Kind::Slide, Intent::Slide),
+                (Kind::Leap, Intent::HighLeap),
+                (Kind::Flip, Intent::Flip),
+            ]);
+            if p.support == Support::Floor {
+                picks.push((Kind::Wrap, Intent::Wrap { dir: if rng.chance(0.5) { 1.0 } else { -1.0 } }));
+            }
+            if p.allow_cursor {
+                picks.push((Kind::Cursor, Intent::GrabCursor { secs: rng.range(2.0, 5.0) }));
+            }
+        }
+        // Don't do the same silly thing twice in a row.
+        picks.retain(|(k, _)| !self.history.iter().rev().take(3).any(|h| h == k));
+        if picks.is_empty() {
+            return (Kind::Trip, Intent::Trip);
+        }
+        let i = ((rng.f32() * picks.len() as f32) as usize).min(picks.len() - 1);
+        picks[i]
     }
 
     fn start_fight(&mut self, id: u32, rng_secs: f32) {
@@ -248,7 +321,22 @@ impl UtilityBrain {
                     *g -= 0.35;
                 }
             }
-            Kind::Drop | Kind::Layer | Kind::Wave | Kind::Follow | Kind::Approach => n.boredom -= 0.2,
+            Kind::Drop | Kind::Layer | Kind::Wave | Kind::Follow | Kind::Approach | Kind::Wake | Kind::Poke => {
+                n.boredom -= 0.2
+            }
+            Kind::Moonwalk
+            | Kind::Sprint
+            | Kind::Trip
+            | Kind::Tantrum
+            | Kind::PlayDead
+            | Kind::Wrap
+            | Kind::Spin
+            | Kind::Panic
+            | Kind::Slide
+            | Kind::Leap => {
+                n.boredom -= 0.3;
+                n.energy -= 0.03;
+            }
             Kind::Walk => n.boredom -= 0.08,
             Kind::Idle | Kind::Sit => {}
         }
@@ -287,6 +375,9 @@ impl Brain for UtilityBrain {
         }
         if matches!(self.grudge, Some((_, g)) if g <= 0.0) {
             self.grudge = None;
+        }
+        if self.current != Kind::Sleep {
+            self.whim_in -= dt;
         }
         if let Some((_, t)) = &mut self.fight {
             *t -= dt;
@@ -331,7 +422,24 @@ impl Brain for UtilityBrain {
                 // Ooh, a game: curiosity spikes (it'll want to go watch).
                 n.boredom = (n.boredom + 0.3).min(1.0);
             }
+            BrainEvent::Poked { from } => {
+                // Woken up. Usually a stretch; sometimes a fright; sometimes grumpy.
+                let roll = (self.whim_in * 7.31).sin().abs();
+                self.reaction = Some(if roll < 0.55 {
+                    (Kind::Idle, Intent::Idle { secs: 2.0, fidget: Gesture::Stretch })
+                } else if roll < 0.8 {
+                    (Kind::Flip, Intent::Flip)
+                } else {
+                    self.start_fight(from, 4.0);
+                    (Kind::Box, Intent::Pose { secs: 0.8, gesture: Gesture::Box })
+                });
+                self.needs.energy = (self.needs.energy + 0.2).min(1.0);
+            }
         }
+    }
+
+    fn whim_due(&self) -> bool {
+        self.whim_in <= 0.0
     }
 
     fn decide(&mut self, p: &Perception, world: &World, rng: &mut Rng) -> Intent {
@@ -344,6 +452,23 @@ impl Brain for UtilityBrain {
             return intent;
         }
         if let Some(intent) = self.fight_move(p, &surf, rng) {
+            return intent;
+        }
+        // Moods drift: the same stickman is a bit different from minute to minute.
+        for t in [
+            &mut self.personality.curiosity,
+            &mut self.personality.laziness,
+            &mut self.personality.mischief,
+            &mut self.personality.playfulness,
+        ] {
+            *t = (*t + rng.range(-0.03, 0.03)).clamp(0.05, 0.95);
+        }
+        // Out of nowhere: a random impulse.
+        if self.whim_in <= 0.0 {
+            let pers = self.personality;
+            self.whim_in = rng.range(5.0, 22.0) * (1.3 - pers.mischief * 0.6 - pers.playfulness * 0.3).max(0.3);
+            let (kind, intent) = self.whim(p, &surf, rng);
+            self.commit(kind);
             return intent;
         }
         // Watching you play a game: go there, and hang around once there.
@@ -459,10 +584,12 @@ impl Brain for UtilityBrain {
             let mut best_jump: Option<(Intent, f32)> = None;
             let skip = world.overlapping(p.foot, s);
             for t in world.surfaces() {
-                if t.support == p.support || matches!(t.support, Support::Inside(_)) || t.x1 - t.x0 < 40.0 * s {
+                let on_head = matches!(t.support, Support::Peer(_));
+                if t.support == p.support || matches!(t.support, Support::Inside(_)) || (t.x1 - t.x0 < 40.0 * s && !on_head) {
                     continue;
                 }
-                let x = rng.range(t.x0 + 15.0 * s, t.x1 - 15.0 * s);
+                // Another stickman's head: aim for the middle (and stack up).
+                let x = if on_head { (t.x0 + t.x1) * 0.5 } else { rng.range(t.x0 + 15.0 * s, t.x1 - 15.0 * s) };
                 let rise = p.foot.y - t.y;
                 let dx = (x - p.hip.x).abs();
                 if rise > p.max_jump || dx > 650.0 * s || (rise.abs() < 10.0 * s && dx < 30.0 * s) {
@@ -473,7 +600,8 @@ impl Brain for UtilityBrain {
                 if !world.arc_clear(p.layer, p.foot, vel, p.gravity, flight, s, &skip) {
                     continue;
                 }
-                let to_game = if watching.is_some() && t.support.window() == watching { 0.5 } else { 0.0 };
+                let to_game = (if watching.is_some() && t.support.window() == watching { 0.5 } else { 0.0 })
+                    + (if on_head { pers.playfulness * 0.3 + pers.mischief * 0.15 } else { 0.0 });
                 let score = (0.3 + b * 0.5 + pers.playfulness * 0.3 + (rise.max(0.0) / p.max_jump) * pers.curiosity * 0.2) * ef
                     - dx / (3000.0 * s)
                     + to_game
@@ -587,6 +715,26 @@ impl Brain for UtilityBrain {
             ));
         }
 
+        // Someone's asleep nearby: go and wake them (gently... usually).
+        for peer in p.peers.iter().filter(|q| q.sleeping && (q.ground - p.foot.y).abs() < 12.0 * s) {
+            let dx = peer.hip.x - p.hip.x;
+            let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+            if dx.abs() < 26.0 * s {
+                options.push((Kind::Poke, Intent::Poke { target: peer.id, dir }, 0.35 + pers.playfulness * 0.3 + pers.mischief * 0.2));
+                options.push((
+                    Kind::Kick,
+                    Intent::Kick { target: Some(peer.id), dir },
+                    pers.mischief * 0.45 - 0.1,
+                ));
+            } else if dx.abs() < 700.0 * s && peer.hip.x > surf.x0 && peer.hip.x < surf.x1 {
+                options.push((
+                    Kind::Wake,
+                    Intent::Walk { x: peer.hip.x - dir * 18.0 * s, speed: 110.0 * s, style: WalkStyle::Sneak },
+                    0.12 + pers.playfulness * 0.25 + pers.mischief * 0.2,
+                ));
+            }
+        }
+
         // Other stickmen on the same level.
         for peer in &p.peers {
             if peer.ragdoll || (peer.hip.y - p.hip.y).abs() > 8.0 * s {
@@ -626,6 +774,13 @@ impl Brain for UtilityBrain {
             options.push((Kind::Layer, Intent::ToggleLayer, 0.08 + pers.mischief * 0.25));
         }
 
+        // Every so often, ignore the scores entirely and just do something.
+        if !options.is_empty() && rng.chance(0.08) {
+            let i = ((rng.f32() * options.len() as f32) as usize).min(options.len() - 1);
+            let (kind, intent, _) = options[i];
+            self.commit(kind);
+            return intent;
+        }
         let mut best = (Kind::Idle, Intent::Idle { secs: 1.0, fidget: Gesture::None }, f32::MIN);
         for (kind, intent, score) in options {
             let repeats = self.history.iter().filter(|h| **h == kind).count() as i32;

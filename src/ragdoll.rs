@@ -174,7 +174,7 @@ impl Ragdoll {
         let surfaces: Vec<Surface> =
             world.surfaces().into_iter().filter(|s| world.can_land(s, layer, None)).collect();
         let room = self.room.and_then(|id| world.window(id)).map(|w| w.rect);
-        let solids: Vec<Rect> = if self.solid {
+        let mut solids: Vec<Rect> = if self.solid {
             let pts = self.p;
             let ignore = self.ignore.get_or_insert_with(|| {
                 world
@@ -193,6 +193,10 @@ impl Ragdoll {
         } else {
             Vec::new()
         };
+        // Other stickmen are solid too, so ragdolls pile up on each other.
+        if self.solid {
+            solids.extend(world.peers.iter().map(|p| p.rect));
+        }
         let links = links(d);
         let mut inv = [1.0f32; N];
         for &(i, _) in &self.pins {

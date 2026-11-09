@@ -17,15 +17,15 @@ mod world;
 use std::time::{Duration, Instant};
 
 use brain::{Brain, BrainEvent, PeerView, Personality, UtilityBrain};
-use games::minesweeper::{self, Helper, Look};
+use games::minesweeper::{Helper, Look};
 use games::{Game, GameEvent, Watcher};
 use math::{v2, Rect, Vec2};
-use peers::Peers;
+use peers::{Incoming, Me, Peers};
 use platform::{Event, MenuItem};
 use render::Style;
 use settings::Settings;
 use stickman::{Dims, Mode, Stickman};
-use world::{button_matches, WinId, World};
+use world::{button_matches, PeerBody, WinId, World};
 
 /// Fixed physics/animation step.
 const STEP: f32 = 1.0 / 120.0;
@@ -76,8 +76,13 @@ fn main() {
     let d = Dims::new(plat.dpi_scale() * SIZE);
     let s = d.s;
     let mut rng = rng::Rng::seeded();
-    let mut world =
-        World { work: plat.work_area(), windows: plat.windows(), taskbar: plat.taskbar(), doors: Vec::new() };
+    let mut world = World {
+        work: plat.work_area(),
+        windows: plat.windows(),
+        taskbar: plat.taskbar(),
+        doors: Vec::new(),
+        peers: Vec::new(),
+    };
     let mut peers = Peers::new();
     let mut watcher = Watcher::default();
     let mut helper = Helper::new(&mut rng);
@@ -188,18 +193,12 @@ fn main() {
                         }
                         Some(MENU_MS_SNAPSHOT) => {
                             if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
-                                let result = minesweeper::snapshot(&mut *plat, id, look_of(game));
-                                // Show the folder with the picture in it.
-                                let path = match result {
-                                    Ok(p) => Some(p),
-                                    Err(e) => {
-                                        eprintln!("stickman: {e}");
-                                        None
+                                // Saves minesweeper.png + minesweeper.txt, then shows the folder.
+                                match helper.snapshot(&mut *plat, id, look_of(game)) {
+                                    Ok(dir) => {
+                                        let _ = std::process::Command::new("explorer").arg(dir).spawn();
                                     }
-                                };
-                                if let Some(dir) = std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("stickman")) {
-                                    let target = path.unwrap_or(dir);
-                                    let _ = std::process::Command::new("explorer").arg("/select,").arg(target).spawn();
+                                    Err(e) => eprintln!("stickman: {e}"),
                                 }
                             }
                         }
@@ -285,10 +284,33 @@ fn main() {
         let foreground = plat.foreground();
         let focus_game = foreground.filter(|id| watcher.game_window(*id).is_some());
 
-        // Other stickmen: share our state, get knocked over by theirs.
-        for hit in peers.update(dt, man.center(), man.vel, man.is_ragdoll()) {
-            man.knock(hit.impulse);
-            brain.notify(BrainEvent::Hit { from: hit.from });
+        // Other stickmen: share our state, get knocked over (or woken) by theirs.
+        let me = Me {
+            hip: man.center(),
+            vel: man.vel,
+            ragdoll: man.is_ragdoll(),
+            sleeping: man.is_sleeping(),
+            body: man.body_rect(),
+        };
+        for msg in peers.update(dt, &me) {
+            match msg {
+                Incoming::Hit { from, impulse } => {
+                    man.knock(impulse);
+                    brain.notify(BrainEvent::Hit { from });
+                }
+                Incoming::Poke { from } => {
+                    if man.is_sleeping() {
+                        man.interrupt();
+                        brain.notify(BrainEvent::Poked { from });
+                    }
+                }
+            }
+        }
+        // Their bodies, for standing on and piling up on.
+        world.peers = peers.list.iter().map(|p| PeerBody { id: p.id, rect: p.body, ragdoll: p.ragdoll }).collect();
+        // A random impulse takes over whatever it's doing (but lets it sleep).
+        if brain.whim_due() && !man.is_sleeping() {
+            man.interrupt();
         }
 
         // Thrown or flying fast into another stickman bowls it over.
@@ -324,8 +346,11 @@ fn main() {
         while acc >= STEP {
             acc -= STEP;
             if !paused && man.wants_intent() {
-                let views =
-                    peers.list.iter().map(|p| PeerView { id: p.id, hip: p.hip, ragdoll: p.ragdoll }).collect();
+                let views = peers
+                    .list
+                    .iter()
+                    .map(|p| PeerView { id: p.id, hip: p.hip, ragdoll: p.ragdoll, sleeping: p.sleeping, ground: p.body.b })
+                    .collect();
                 if let Some(p) = man.perceive(cursor, views, focus_game) {
                     let intent = brain.decide(&p, &world, &mut rng);
                     man.apply(intent, &world);
@@ -342,6 +367,9 @@ fn main() {
                         peers.send_hit(target, impulse);
                     }
                 }
+            }
+            if let Some(target) = ev.poke {
+                peers.send_poke(target);
             }
             if ev.stomped {
                 match sweeper {

@@ -50,6 +50,40 @@ impl Uia {
         out
     }
 
+    /// Every element inside a window: (name, class name, control type id,
+    /// screen rect). Used to find game tiles and for diagnostics.
+    pub fn elements(&self, hwnd: *mut c_void) -> Vec<(String, String, i32, Rect)> {
+        let mut out = Vec::new();
+        if hwnd.is_null() {
+            return out;
+        }
+        unsafe {
+            let Ok(root) = self.auto.ElementFromHandle(HWND(hwnd)) else { return out };
+            let mut stack = vec![(root, 0u32)];
+            let walker = match self.auto.RawViewWalker() {
+                Ok(w) => w,
+                Err(_) => return out,
+            };
+            while let Some((el, depth)) = stack.pop() {
+                if out.len() > 3000 || depth > 12 {
+                    continue;
+                }
+                let name = el.CurrentName().map(|b| b.to_string()).unwrap_or_default();
+                let class = el.CurrentClassName().map(|b| b.to_string()).unwrap_or_default();
+                let kind = el.CurrentControlType().map(|t| t.0).unwrap_or(0);
+                if let Ok(r) = el.CurrentBoundingRectangle() {
+                    out.push((name, class, kind, Rect { l: r.left as f32, t: r.top as f32, r: r.right as f32, b: r.bottom as f32 }));
+                }
+                let mut child = walker.GetFirstChildElement(&el).ok();
+                while let Some(c) = child {
+                    child = walker.GetNextSiblingElement(&c).ok();
+                    stack.push((c, depth + 1));
+                }
+            }
+        }
+        out
+    }
+
     unsafe fn walk(
         &self,
         el: &IUIAutomationElement,

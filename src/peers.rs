@@ -1,22 +1,30 @@
-//! Lets several stickman.exe processes see and hit each other.
+//! Lets several stickman.exe processes see, stand on, hit and wake each
+//! other.
 //!
 //! Each process binds one UDP port in a small range on 127.0.0.1 (never the
-//! network) and a few times a second sends its position to every other port
-//! in the range. Hits are sent the same way and the target picks them out.
+//! network) and a few times a second sends its position and body outline to
+//! every other port in the range. Hits and pokes are sent the same way and
+//! the target picks them out.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::math::{v2, Vec2};
+use crate::math::{v2, Rect, Vec2};
 
-const MAGIC: [u8; 4] = *b"STK1";
+/// Bumped whenever the message layout changes.
+const MAGIC: [u8; 4] = *b"STK2";
 const BASE_PORT: u16 = 47_810;
 const SLOTS: u16 = 16;
-const SEND_EVERY: f32 = 0.05;
+/// Often enough that standing on someone's head looks smooth.
+const SEND_EVERY: f32 = 1.0 / 30.0;
 const TIMEOUT: Duration = Duration::from_millis(1000);
 
 const KIND_STATE: u8 = 1;
 const KIND_HIT: u8 = 2;
+const KIND_POKE: u8 = 3;
+
+const FLAG_RAGDOLL: u8 = 1;
+const FLAG_SLEEPING: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Peer {
@@ -24,12 +32,15 @@ pub struct Peer {
     pub hip: Vec2,
     pub vel: Vec2,
     pub ragdoll: bool,
+    pub sleeping: bool,
+    /// Bounding box of its body.
+    pub body: Rect,
     seen: Instant,
 }
 
-pub struct Hit {
-    pub from: u32,
-    pub impulse: Vec2,
+pub enum Incoming {
+    Hit { from: u32, impulse: Vec2 },
+    Poke { from: u32 },
 }
 
 pub struct Peers {
@@ -50,6 +61,15 @@ fn get_f32(b: &[u8], at: usize) -> f32 {
 
 fn get_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// What our own body is doing, to share with the others.
+pub struct Me {
+    pub hip: Vec2,
+    pub vel: Vec2,
+    pub ragdoll: bool,
+    pub sleeping: bool,
+    pub body: Rect,
 }
 
 impl Peers {
@@ -77,40 +97,49 @@ impl Peers {
         }
     }
 
-    pub fn send_hit(&self, target: u32, impulse: Vec2) {
-        let mut msg = Vec::with_capacity(21);
+    fn header(&self, kind: u8) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(48);
         msg.extend_from_slice(&MAGIC);
-        msg.push(KIND_HIT);
+        msg.push(kind);
         msg.extend_from_slice(&self.id.to_le_bytes());
+        msg
+    }
+
+    pub fn send_hit(&self, target: u32, impulse: Vec2) {
+        let mut msg = self.header(KIND_HIT);
         msg.extend_from_slice(&target.to_le_bytes());
         put_f32(&mut msg, impulse.x);
         put_f32(&mut msg, impulse.y);
         self.broadcast(&msg);
     }
 
-    /// Send our state now and then, read everything waiting, return hits on us.
-    pub fn update(&mut self, dt: f32, hip: Vec2, vel: Vec2, ragdoll: bool) -> Vec<Hit> {
-        let mut hits = Vec::new();
+    pub fn send_poke(&self, target: u32) {
+        let mut msg = self.header(KIND_POKE);
+        msg.extend_from_slice(&target.to_le_bytes());
+        self.broadcast(&msg);
+    }
+
+    /// Send our state now and then, read everything waiting, return what
+    /// was aimed at us.
+    pub fn update(&mut self, dt: f32, me: &Me) -> Vec<Incoming> {
+        let mut incoming = Vec::new();
         if self.sock.is_none() {
-            return hits;
+            return incoming;
         }
 
         self.timer -= dt;
         if self.timer <= 0.0 {
             self.timer = SEND_EVERY;
-            let mut msg = Vec::with_capacity(26);
-            msg.extend_from_slice(&MAGIC);
-            msg.push(KIND_STATE);
-            msg.extend_from_slice(&self.id.to_le_bytes());
-            put_f32(&mut msg, hip.x);
-            put_f32(&mut msg, hip.y);
-            put_f32(&mut msg, vel.x);
-            put_f32(&mut msg, vel.y);
-            msg.push(ragdoll as u8);
+            let mut msg = self.header(KIND_STATE);
+            for v in [me.hip.x, me.hip.y, me.vel.x, me.vel.y, me.body.l, me.body.t, me.body.r, me.body.b] {
+                put_f32(&mut msg, v);
+            }
+            let flags = (if me.ragdoll { FLAG_RAGDOLL } else { 0 }) | (if me.sleeping { FLAG_SLEEPING } else { 0 });
+            msg.push(flags);
             self.broadcast(&msg);
         }
 
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 96];
         for _ in 0..256 {
             let Some(sock) = &self.sock else { break };
             let n = match sock.recv_from(&mut buf) {
@@ -128,12 +157,15 @@ impl Peers {
                 continue;
             }
             match b[4] {
-                KIND_STATE if n >= 26 => {
+                KIND_STATE if n >= 42 => {
+                    let f = |i: usize| get_f32(b, 9 + i * 4);
                     let peer = Peer {
                         id: from,
-                        hip: v2(get_f32(b, 9), get_f32(b, 13)),
-                        vel: v2(get_f32(b, 17), get_f32(b, 21)),
-                        ragdoll: b[25] != 0,
+                        hip: v2(f(0), f(1)),
+                        vel: v2(f(2), f(3)),
+                        body: Rect { l: f(4), t: f(5), r: f(6), b: f(7) },
+                        ragdoll: b[41] & FLAG_RAGDOLL != 0,
+                        sleeping: b[41] & FLAG_SLEEPING != 0,
                         seen: Instant::now(),
                     };
                     match self.list.iter_mut().find(|p| p.id == from) {
@@ -143,14 +175,19 @@ impl Peers {
                 }
                 KIND_HIT if n >= 21 => {
                     if get_u32(b, 9) == self.id {
-                        hits.push(Hit { from, impulse: v2(get_f32(b, 13), get_f32(b, 17)) });
+                        incoming.push(Incoming::Hit { from, impulse: v2(get_f32(b, 13), get_f32(b, 17)) });
+                    }
+                }
+                KIND_POKE if n >= 13 => {
+                    if get_u32(b, 9) == self.id {
+                        incoming.push(Incoming::Poke { from });
                     }
                 }
                 _ => {}
             }
         }
         self.list.retain(|p| p.seen.elapsed() < TIMEOUT);
-        hits
+        incoming
     }
 
     pub fn get(&self, id: u32) -> Option<&Peer> {

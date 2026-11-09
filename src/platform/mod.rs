@@ -66,6 +66,9 @@ pub trait Platform {
     fn capture(&mut self, r: Rect) -> Option<Image>;
     /// Left-click a window at a screen position, without moving your mouse.
     fn post_click(&self, id: WinId, at: Vec2);
+    /// Everything UI Automation can see inside a window:
+    /// (name, class, control type id, screen rect).
+    fn ui_elements(&mut self, id: WinId) -> Vec<(String, String, i32, Rect)>;
 }
 
 /// Plain RGBA image (not premultiplied; screen captures are opaque).

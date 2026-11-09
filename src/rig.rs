@@ -34,6 +34,10 @@ pub enum Gesture {
     EdgeSit,
     /// Arms windmilling, trying not to fall off a moving window.
     Balance,
+    /// Spinning on the spot with arms out.
+    Spin,
+    /// Baseball slide: low, leaning back, feet first.
+    Slide,
 }
 
 impl Gesture {
@@ -61,6 +65,10 @@ pub enum WalkStyle {
     Limp,
     /// Badly hurt: on hands and knees.
     Crawl,
+    /// Gliding backwards (the stickman faces away from where it's going).
+    Moonwalk,
+    /// Running away screaming, arms flailing over its head.
+    Panic,
 }
 
 impl WalkStyle {
@@ -75,6 +83,8 @@ impl WalkStyle {
             WalkStyle::Shuffle => 45.0,
             WalkStyle::Limp => 40.0,
             WalkStyle::Crawl => 22.0,
+            WalkStyle::Moonwalk => 60.0,
+            WalkStyle::Panic => 380.0,
         }
     }
 }
@@ -101,6 +111,8 @@ fn gait(style: WalkStyle) -> Gait {
         WalkStyle::Skip => g(0.0, 1.6, 1.3, 0.9, 0.05, 1.2, 3.0),
         WalkStyle::Shuffle => g(2.0, 0.35, 0.6, 1.5, 0.18, 0.3, 0.0),
         WalkStyle::Limp => g(1.0, 0.6, 0.7, 1.5, 0.12, 0.5, 0.0),
+        WalkStyle::Moonwalk => g(0.5, 0.45, 1.2, 1.3, -0.05, 0.4, 0.0),
+        WalkStyle::Panic => g(1.0, 1.4, 1.2, 0.8, 0.25, 0.0, 0.5),
     }
 }
 
@@ -379,6 +391,15 @@ impl Rig {
                 step_pair(&mut self.feet, ideal, lead, 6.0 * s, 0.4, v2(0.0, -2.0 * s), snap, dt);
                 lean_target = f * 1.3;
             }
+            RigState::Stand { ground_y, gesture: Gesture::Slide, .. } => {
+                // Feet-first slide along the ground.
+                hip.y = ground_y - 6.0 * s;
+                for i in 0..2 {
+                    let target = v2(hip.x + f * (20.0 + i as f32 * 5.0) * s, ground_y - i as f32 * 3.0 * s);
+                    self.feet[i].follow(target, 10.0, 0.8, dt);
+                }
+                lean_target = -f * 0.9;
+            }
             RigState::Stand { ground_y, style, .. } => {
                 let g = gait(style);
                 let sitk = self.sit.x.clamp(0.0, 1.0);
@@ -650,6 +671,21 @@ impl Rig {
                             let ph = t * 9.0 + fi * PI;
                             target = chest + v2(side * arm * 0.75 + ph.cos() * 5.0 * s, -4.0 * s + ph.sin() * 5.0 * s);
                             freq = 9.0;
+                        }
+                        Gesture::Spin => {
+                            target = chest + v2(side * arm * 0.85, -3.0 * s);
+                            freq = 12.0;
+                        }
+                        Gesture::Slide => {
+                            // One hand dragging behind, one thrown up.
+                            target = if i == 0 { v2(hip.x - f * 6.0 * s, ground_y) } else { chest + v2(f * 4.0 * s, -18.0 * s) };
+                            freq = 10.0;
+                        }
+                        _ if style == WalkStyle::Panic => {
+                            // Arms flailing over its head.
+                            target = chest
+                                + v2(side * 8.0 * s + (t * 20.0 + fi).sin() * 4.0 * s, -16.0 * s + (t * 17.0 + fi).cos() * 4.0 * s);
+                            freq = 10.0;
                         }
                         _ => {}
                     }

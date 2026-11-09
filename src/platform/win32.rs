@@ -453,6 +453,16 @@ impl Platform for Win32Platform {
         }
     }
 
+    fn ui_elements(&mut self, id: WinId) -> Vec<(String, String, i32, Rect)> {
+        if self.uia.is_none() {
+            self.uia = Uia::new();
+        }
+        match &self.uia {
+            Some(u) => u.elements(id as usize as HWND),
+            None => Vec::new(),
+        }
+    }
+
     fn window_title(&self, id: WinId) -> String {
         let mut buf = [0u16; 256];
         let n = unsafe { GetWindowTextW(id as usize as HWND, buf.as_mut_ptr(), buf.len() as i32) };

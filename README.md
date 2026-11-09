@@ -57,13 +57,26 @@ over time, faster while asleep.
 like a pancake against the screen edge (or the floor, if a window comes
 down on it), then pops out limp.
 
+**Unpredictable.** Every so often a random impulse takes over: it trips
+over nothing, throws a tantrum on the floor, plays dead (and jumps up when
+your cursor comes near), moonwalks, runs screaming from your cursor, spins,
+does a baseball slide, leaps sky-high, or runs off one side of the screen
+and comes back in the other. Its personality also drifts over time, and now
+and then it ignores all its reasoning and just does something.
+
+**Stacking.** Stickmen can jump onto each other's heads and get carried
+around, and ragdolls pile up on each other. A stickman may sneak over to
+one that's asleep and poke it awake (or, if it's mischievous, kick it).
+
 **Fights.** Once two stickmen start fighting they keep at it for several
 seconds: closing in, mixing punches and kicks, backing off, guarding, and
 waiting for the other to get up.
 
-**Moving windows.** Standing or sitting on a window you drag around, it
-wobbles and windmills its arms to keep its balance. Drag it down faster
-than it can fall and it gets left behind; yank it hard and it ragdolls.
+**Moving windows.** It isn't glued on: friction only lets it keep up so
+fast, so if you yank a window it slides out from under it (it stumbles,
+windmills its arms, slips off the edge or goes over), and if you stop
+suddenly it skids on. Drag it down faster than it can fall and it gets left
+behind. Minimizing the window it's on, or a big fall, can send it flailing.
 Maximized windows count as background (nothing to climb or stand on).
 
 **Classic games.** It recognises the XP, Vista (including the Ultimate
@@ -76,8 +89,11 @@ stomps it open for you. It only picks tiles the visible numbers *prove* are
 safe, ignores your flags (a wrong one could trick it), and re-checks the
 board right before pressing, so it can't lose the game for you. Turn on
 "Let it make mistakes" (Games menu) if you'd like it to occasionally gamble.
-It reads the board from the screen; if it misreads yours, use "Save
-Minesweeper snapshot" in the Games menu and share the picture.
+It reads the board from the screen (and asks the game's accessibility tree
+where the tiles are if that fails). If it isn't helping, use "Save
+Minesweeper snapshot" in the Games menu: it saves `minesweeper.png` and
+`minesweeper.txt` (what it sees and why it isn't helping) in
+`%APPDATA%\stickman`.
 
 **Gravity** can be changed from the right-click menu (Moon to Jupiter).
 Lower gravity also means higher, floatier jumps.
