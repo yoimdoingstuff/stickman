@@ -478,6 +478,78 @@ pub fn grid_from_elements(rects: &[Rect]) -> Option<Grid> {
     Some(Grid { origin: v2(xs[0], ys[0]), pitch, cols, rows })
 }
 
+/// What a tile's accessibility name says it is. Windows 7 Minesweeper
+/// names them like "Row 3, Column 5 Tile (Concealed)." — the part after
+/// "Tile" is parsed generously so other wordings also work.
+fn tile_state(s: &str) -> Option<Cell> {
+    const WORDS: [&str; 8] = ["one", "two", "three", "four", "five", "six", "seven", "eight"];
+    if s.contains("flag") {
+        return Some(Cell::Flag);
+    }
+    if s.contains("question") || s.contains("conceal") || (s.contains("covered") && !s.contains("uncovered")) {
+        return Some(Cell::Hidden);
+    }
+    if let Some(d) = s.chars().find(|c| ('1'..='8').contains(c)) {
+        return Some(Cell::Open(d as u8 - b'0'));
+    }
+    if let Some(i) = WORDS.iter().position(|w| s.split(|c: char| !c.is_alphabetic()).any(|t| t == *w)) {
+        return Some(Cell::Open(i as u8 + 1));
+    }
+    if s.contains("mine") || s.contains("bomb") || s.contains("explod") {
+        return Some(Cell::Mine);
+    }
+    if ["reveal", "empty", "blank", "uncovered", "open", "clear", "0", "zero"].iter().any(|k| s.contains(k)) {
+        return Some(Cell::Open(0));
+    }
+    None
+}
+
+/// "Row R, Column C Tile (...)" -> (row, column, the bit after "Tile").
+fn parse_tile_name(name: &str) -> Option<(usize, usize, String)> {
+    let lower = name.to_lowercase();
+    let rest = lower.trim().strip_prefix("row ")?;
+    let (r, rest) = rest.split_once(',')?;
+    let r: usize = r.trim().parse().ok()?;
+    let rest = rest.trim_start().strip_prefix("column ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let c: usize = digits.parse().ok()?;
+    let rest = rest[digits.len()..].trim_start().strip_prefix("tile")?;
+    Some((r, c, rest.to_string()))
+}
+
+/// Read the whole board from the game's accessibility tree: every tile is
+/// listed with its position, size and state. No pixels involved.
+pub fn board_from_names(elements: &[(String, String, i32, Rect)]) -> Result<Board, String> {
+    let mut tiles: Vec<(usize, usize, Rect, Cell)> = Vec::new();
+    for (name, class, _, r) in elements {
+        // Depending on the game version the label is in the name or the class field.
+        let Some((row, col, state)) = parse_tile_name(name).or_else(|| parse_tile_name(class)) else { continue };
+        let cell = tile_state(&state).ok_or_else(|| format!("don't know the tile state {state:?}"))?;
+        tiles.push((row, col, *r, cell));
+    }
+    if tiles.is_empty() {
+        return Err("no tiles listed".into());
+    }
+    let rows = tiles.iter().map(|t| t.0).max().unwrap_or(0);
+    let cols = tiles.iter().map(|t| t.1).max().unwrap_or(0);
+    if rows == 0 || cols == 0 || tiles.len() != rows * cols {
+        return Err(format!("{} tiles listed for a {cols}x{rows} board", tiles.len()));
+    }
+    let mut cells = vec![Cell::Hidden; rows * cols];
+    for &(r, c, _, cell) in &tiles {
+        if r == 0 || c == 0 {
+            return Err("tile numbering doesn't start at 1".into());
+        }
+        cells[(r - 1) * cols + (c - 1)] = cell;
+    }
+    let first = tiles.iter().find(|t| t.0 == 1 && t.1 == 1).map(|t| t.2).ok_or("no top-left tile")?;
+    let pitch = v2(first.r - first.l, first.b - first.t);
+    if pitch.x < 4.0 || pitch.y < 4.0 {
+        return Err("tiles have no size (window minimized?)".into());
+    }
+    Ok(Board { cols, rows, cells, origin: v2(first.l, first.t), pitch })
+}
+
 /// XP: fixed layout. The grid starts 12,55 px into the window and tiles
 /// are 16 px, all scaled by `scale` when Windows stretches the old game.
 fn read_xp(img: &Image, origin: Vec2, scale: f32) -> Result<Board, String> {
@@ -527,6 +599,8 @@ struct Pending {
     cell: (usize, usize),
     risky: bool,
     age: f32,
+    /// Tiles open when it decided (fewer later = a new game started).
+    opened: usize,
 }
 
 /// Decides when to help and which tile to press.
@@ -566,9 +640,23 @@ impl Helper {
         3 + (rng.f32() * 4.0) as u32
     }
 
-    /// Read the board: from the picture, or failing that with the grid that
-    /// UI Automation reports.
-    fn read(&mut self, plat: &mut dyn Platform, game: WinId, look: Look) -> Result<Board, String> {
+    /// Read the board. Best: the tile list from the game's accessibility
+    /// tree (exact). Otherwise from the picture, with the grid from the
+    /// picture or from the accessibility tree. `max_age` is how old (s) the
+    /// accessibility data may be.
+    fn read(&mut self, plat: &mut dyn Platform, game: WinId, look: Look, max_age: f32) -> Result<Board, String> {
+        let mut names_err = String::from("no accessibility data yet");
+        if look == Look::Modern {
+            let (elems, age) = plat.ui_elements(game);
+            if age <= max_age {
+                match board_from_names(&elems) {
+                    Ok(b) => return Ok(b),
+                    Err(e) => names_err = e,
+                }
+            } else if age < f32::MAX {
+                names_err = format!("accessibility data is {age:.1}s old");
+            }
+        }
         let scale = plat.dpi_scale();
         let (img, origin) = grab(plat, game)?;
         if look == Look::Xp {
@@ -577,7 +665,7 @@ impl Helper {
         let from_pixels = grid_from_pixels(&img, origin).and_then(|g| board_from_grid(&img, origin, g));
         let pixel_err = match from_pixels {
             Ok(b) => return Ok(b),
-            Err(e) => e,
+            Err(e) => format!("{e} (tile names: {names_err})"),
         };
         // Look the grid up through UI Automation now and then.
         let client = plat.client_rect(game).unwrap_or(Rect { l: 0.0, t: 0.0, r: 0.0, b: 0.0 });
@@ -585,7 +673,7 @@ impl Helper {
         if stale && self.uia_checked <= 0.0 {
             // The answer arrives in the background; this picks up the last one.
             self.uia_checked = 1.0;
-            let rects: Vec<Rect> = plat.ui_elements(game).into_iter().map(|e| e.3).collect();
+            let rects: Vec<Rect> = plat.ui_elements(game).0.into_iter().map(|e| e.3).collect();
             self.uia_grid = grid_from_elements(&rects).map(|g| (game, client, g));
         }
         match self.uia_grid {
@@ -622,7 +710,7 @@ impl Helper {
             return None;
         }
         self.timer = 0.3;
-        let board = match self.read(plat, game, look) {
+        let board = match self.read(plat, game, look, 3.0) {
             Ok(b) => b,
             Err(e) => {
                 self.status = format!("can't read the board: {e}");
@@ -679,7 +767,7 @@ impl Helper {
             (safe[((rng.f32() * safe.len() as f32) as usize).min(safe.len() - 1)], false)
         };
         self.status = format!("jumping onto tile ({},{})", cell.0, cell.1);
-        self.pending = Some(Pending { game, cell, risky, age: 0.0 });
+        self.pending = Some(Pending { game, cell, risky, age: 0.0, opened });
         Some(board.top(cell.0, cell.1))
     }
 
@@ -691,10 +779,15 @@ impl Helper {
     /// The stickman's feet just hit the tile: press it, if it's still safe.
     pub fn stomped(&mut self, plat: &mut dyn Platform, look: Look, rng: &mut Rng) {
         let Some(p) = self.pending.take() else { return };
-        let Ok(board) = self.read(plat, p.game, look) else {
+        // Only act on recent information.
+        let Ok(board) = self.read(plat, p.game, look, 1.5) else {
             self.status = "landed, but couldn't re-read the board, so didn't press".into();
             return;
         };
+        if board.opened() < p.opened {
+            self.status = "landed, but a new game started meanwhile, so didn't press".into();
+            return;
+        }
         let (c, r) = p.cell;
         if c >= board.cols || r >= board.rows || board.at(c, r) != Cell::Hidden || board.lost() {
             self.status = "landed, but that tile is already open".into();
@@ -705,7 +798,9 @@ impl Helper {
             self.status = "landed, but the tile is no longer provably safe, so didn't press".into();
             return;
         }
-        plat.post_click(p.game, board.center(c, r));
+        // Press it through the accessibility tree (falls back to a click).
+        let label = format!("Row {}, Column {} Tile", r + 1, c + 1);
+        plat.press(p.game, &label, board.center(c, r));
         self.status = format!("pressed tile ({c},{r})");
         self.ours = true;
         self.uncovers = 0;
@@ -727,7 +822,7 @@ impl Helper {
         let (img, origin) = grab(plat, game)?;
         self.uia_checked = 0.0;
         self.uia_grid = None;
-        let board = self.read(plat, game, look);
+        let board = self.read(plat, game, look, 5.0);
         match &board {
             Ok(b) => {
                 let _ = writeln!(report, "Board: {}", b.summary());
@@ -738,7 +833,8 @@ impl Helper {
             }
         }
         let _ = writeln!(report, "Pixel grid: {:?}", grid_from_pixels(&img, origin));
-        let elems = plat.ui_elements(game);
+        let elems = plat.ui_elements(game).0;
+        let _ = writeln!(report, "Board from tile names: {:?}", board_from_names(&elems).map(|b| b.summary()));
         let rects: Vec<Rect> = elems.iter().map(|e| e.3).collect();
         let _ = writeln!(report, "Accessibility grid: {:?}", grid_from_elements(&rects));
         let _ = writeln!(report, "\nAccessibility elements ({}):", elems.len());
@@ -858,6 +954,45 @@ mod tests {
         assert_eq!(digit([0, 128, 128]), Some(6));
         assert_eq!(digit([0, 0, 0]), Some(7));
         assert_eq!(digit([128, 128, 128]), Some(8));
+    }
+
+    #[test]
+    fn board_from_win7_tile_names() {
+        // What Windows 7 Minesweeper actually reports (one tile per entry).
+        let mut elems = vec![("Minesweeper".to_string(), "Minesweeper".to_string(), 50032, Rect { l: 0.0, t: 0.0, r: 500.0, b: 500.0 })];
+        for r in 1..=9 {
+            for c in 1..=9 {
+                let state = match (r, c) {
+                    (1, 1) => "(Flagged)",
+                    (2, 2) => "(Revealed, 3 mines around)",
+                    (3, 3) => "(Empty)",
+                    _ => "(Concealed)",
+                };
+                let (x, y) = (841.0 + (c - 1) as f32 * 42.0, 411.0 + (r - 1) as f32 * 42.0);
+                elems.push((
+                    format!("Row {r}, Column {c} Tile {state}."),
+                    String::new(),
+                    50000,
+                    Rect { l: x, t: y, r: x + 42.0, b: y + 42.0 },
+                ));
+            }
+        }
+        let b = board_from_names(&elems).expect("board");
+        assert_eq!((b.cols, b.rows), (9, 9));
+        assert_eq!(b.origin, v2(841.0, 411.0));
+        assert_eq!(b.pitch, v2(42.0, 42.0));
+        assert_eq!(b.at(0, 0), Cell::Flag);
+        assert_eq!(b.at(1, 1), Cell::Open(3));
+        assert_eq!(b.at(2, 2), Cell::Open(0));
+        assert_eq!(b.at(8, 8), Cell::Hidden);
+    }
+
+    #[test]
+    fn tile_names_dont_confuse_columns() {
+        // "Column 1" must not match "Column 10".
+        assert_eq!(parse_tile_name("Row 2, Column 10 Tile (Concealed).").map(|t| (t.0, t.1)), Some((2, 10)));
+        assert_eq!(tile_state(" (concealed)."), Some(Cell::Hidden));
+        assert_eq!(tile_state(" (two mines)"), Some(Cell::Open(2)));
     }
 
     #[test]

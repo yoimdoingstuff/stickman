@@ -45,15 +45,83 @@ pub enum Support {
     Inside(WinId),
     /// On top of another stickman (from another stickman.exe).
     Peer(u32),
+    /// The top of a box on a web page (text, image, button...) inside a
+    /// browser window. `key` identifies the box across page refreshes.
+    Ledge { win: WinId, key: u32 },
 }
 
 impl Support {
     pub fn window(self) -> Option<WinId> {
         match self {
-            Support::Floor | Support::Peer(_) => None,
+            Support::Floor | Support::Peer(_) | Support::Ledge { .. } => None,
             Support::Window(id) | Support::Inside(id) => Some(id),
         }
     }
+
+    /// The window this support is part of (including page ledges).
+    pub fn host(self) -> Option<WinId> {
+        match self {
+            Support::Ledge { win, .. } => Some(win),
+            s => s.window(),
+        }
+    }
+}
+
+/// A web page shown in a browser window, and the ledges on it.
+#[derive(Clone, Debug)]
+pub struct Page {
+    pub win: WinId,
+    pub doc: Rect,
+    pub ledges: Vec<Rect>,
+}
+
+/// Same-shaped boxes keep their key when the page scrolls (only y changes).
+pub fn ledge_key(r: &Rect) -> u32 {
+    let l = (r.l / 4.0).round() as i32 as u32;
+    let w = ((r.r - r.l) / 4.0).round() as i32 as u32;
+    l.wrapping_mul(73_856_093) ^ w.wrapping_mul(19_349_663)
+}
+
+/// Turn a page's boxes into ledges worth standing on: wide enough, not the
+/// giant containers, with headroom, and with near-duplicates (a paragraph and
+/// the text inside it) merged.
+pub fn page_ledges(doc: Rect, boxes: &[(Rect, i32)], s: f32) -> Vec<Rect> {
+    // Text, image, button, hyperlink, edit, list item, group, header,
+    // menu item, combo box, check box, table, data item.
+    const KINDS: [i32; 13] = [50020, 50006, 50000, 50005, 50004, 50007, 50026, 50034, 50011, 50003, 50002, 50036, 50029];
+    let doc_area = (doc.r - doc.l) * (doc.b - doc.t);
+    let mut ledges: Vec<Rect> = boxes
+        .iter()
+        .filter(|(_, k)| KINDS.contains(k))
+        .map(|(r, _)| Rect { l: r.l.max(doc.l), t: r.t, r: r.r.min(doc.r), b: r.b.min(doc.b) })
+        .filter(|r| {
+            let (w, h) = (r.r - r.l, r.b - r.t);
+            w >= 40.0 * s
+                && h >= 10.0 * s
+                && r.t > doc.t + 50.0 * s
+                && r.t < doc.b - 8.0 * s
+                && w * h < doc_area * 0.4
+        })
+        .collect();
+    ledges.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<Rect> = Vec::new();
+    for r in ledges {
+        let dup = out.iter_mut().find(|o| {
+            let overlap = r.r.min(o.r) - r.l.max(o.l);
+            (r.t - o.t).abs() < 5.0 * s && overlap > 0.6 * (r.r - r.l).min(o.r - o.l)
+        });
+        match dup {
+            Some(o) => {
+                o.l = o.l.min(r.l);
+                o.r = o.r.max(r.r);
+            }
+            None => out.push(r),
+        }
+    }
+    // Plenty, but not thousands.
+    out.sort_by(|a, b| (b.r - b.l).partial_cmp(&(a.r - a.l)).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(250);
+    out
 }
 
 /// Another stickman's body, for standing on and bumping into.
@@ -108,7 +176,7 @@ impl Layer {
     /// The layer you're on when standing on `support`.
     pub fn for_support(support: Support, current: Layer) -> Layer {
         match support {
-            Support::Window(id) | Support::Inside(id) => Layer::On(id),
+            Support::Window(id) | Support::Inside(id) | Support::Ledge { win: id, .. } => Layer::On(id),
             Support::Peer(_) => current,
             Support::Floor if current == Layer::Behind => Layer::Behind,
             Support::Floor => Layer::Front,
@@ -127,6 +195,8 @@ pub struct World {
     pub doors: Vec<(WinId, Rect)>,
     /// Other stickmen's bodies.
     pub peers: Vec<PeerBody>,
+    /// Web pages in browser windows it's near or in.
+    pub pages: Vec<Page>,
 }
 
 /// Does a taskbar button belong to this window? Button names are either the
@@ -210,8 +280,41 @@ impl World {
         self.windows.iter().find(|w| w.id == id)
     }
 
+    /// The page ledge with this key, the one nearest to `near_y` if several
+    /// boxes share a shape (list items, etc.).
+    fn ledge(&self, win: WinId, key: u32, near_y: Option<f32>) -> Option<Rect> {
+        let page = self.pages.iter().find(|p| p.win == win)?;
+        let mut best: Option<Rect> = None;
+        for r in page.ledges.iter().filter(|r| ledge_key(r) == key) {
+            let better = match (best, near_y) {
+                (None, _) => true,
+                (Some(b), Some(y)) => (r.t - y).abs() < (b.t - y).abs(),
+                (Some(_), None) => false,
+            };
+            if better {
+                best = Some(*r);
+            }
+        }
+        best
+    }
+
+    /// Like `surface`, but for page ledges picks the one nearest `near_y`.
+    pub fn surface_near(&self, support: Support, near_y: f32) -> Option<Surface> {
+        match support {
+            Support::Ledge { win, key } => {
+                let r = self.ledge(win, key, Some(near_y))?;
+                Some(Surface { support, x0: r.l, x1: r.r, y: r.t, walled: false })
+            }
+            _ => self.surface(support),
+        }
+    }
+
     pub fn surface(&self, support: Support) -> Option<Surface> {
         match support {
+            Support::Ledge { win, key } => {
+                let r = self.ledge(win, key, None)?;
+                Some(Surface { support, x0: r.l, x1: r.r, y: r.t, walled: false })
+            }
             Support::Floor => Some(Surface {
                 support,
                 x0: self.work.l,
@@ -272,12 +375,20 @@ impl World {
         for p in &self.peers {
             out.extend(self.surface(Support::Peer(p.id)));
         }
+        for page in &self.pages {
+            for r in &page.ledges {
+                let support = Support::Ledge { win: page.win, key: ledge_key(r) };
+                out.push(Surface { support, x0: r.l, x1: r.r, y: r.t, walled: false });
+            }
+        }
         out
     }
 
     /// The point a support moves with (so we can ride along when it moves).
-    pub fn support_origin(&self, support: Support) -> Option<Vec2> {
+    /// `near` picks between same-shaped page ledges.
+    pub fn support_origin(&self, support: Support, near: Option<Vec2>) -> Option<Vec2> {
         match support {
+            Support::Ledge { win, key } => self.ledge(win, key, near.map(|p| p.y)).map(|r| v2(r.l, r.t)),
             Support::Floor => None,
             Support::Window(id) | Support::Inside(id) => self.window(id).map(|w| v2(w.rect.l, w.rect.t)),
             Support::Peer(id) => self.peers.iter().find(|p| p.id == id).map(|p| v2((p.rect.l + p.rect.r) * 0.5, p.rect.t)),
@@ -289,7 +400,9 @@ impl World {
     /// inside every window you fall past.
     pub fn can_land(&self, s: &Surface, layer: Layer, target: Option<Support>) -> bool {
         match s.support {
-            Support::Inside(id) => layer == Layer::On(id) || target == Some(s.support),
+            // Inside a window (its floor, or boxes on its web page): only if
+            // we're in that window already, or jumping there on purpose.
+            Support::Inside(id) | Support::Ledge { win: id, .. } => layer == Layer::On(id) || target == Some(s.support),
             _ => true,
         }
     }

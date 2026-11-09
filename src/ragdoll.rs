@@ -193,9 +193,11 @@ impl Ragdoll {
         } else {
             Vec::new()
         };
-        // Other stickmen are solid too, so ragdolls pile up on each other.
+        // Other *ragdolled* stickmen are solid, so ragdolls pile up on each
+        // other. Standing ones aren't: flying into them knocks them over
+        // instead (handled by the hit check), rather than bouncing off.
         if self.solid {
-            solids.extend(world.peers.iter().map(|p| p.rect));
+            solids.extend(world.peers.iter().filter(|p| p.ragdoll).map(|p| p.rect));
         }
         let links = links(d);
         let mut inv = [1.0f32; N];

@@ -67,8 +67,17 @@ pub trait Platform {
     /// Left-click a window at a screen position, without moving your mouse.
     fn post_click(&self, id: WinId, at: Vec2);
     /// Everything UI Automation can see inside a window:
-    /// (name, class, control type id, screen rect).
-    fn ui_elements(&mut self, id: WinId) -> Vec<(String, String, i32, Rect)>;
+    /// (name, class, control type id, screen rect), and how many seconds old
+    /// that list is. Fetched in the background: asks for a fresh copy and
+    /// returns the latest one (empty at first).
+    fn ui_elements(&mut self, id: WinId) -> (Vec<(String, String, i32, Rect)>, f32);
+    /// Press the element in `id` whose accessibility name starts with
+    /// `name_prefix` (falls back to clicking at `at`).
+    fn press(&mut self, id: WinId, name_prefix: &str, at: Vec2);
+    /// The page in a browser window: its rect, every box on it (with its
+    /// control type), and how old that is in seconds. Background-fetched
+    /// like `ui_elements`.
+    fn page_boxes(&mut self, id: WinId) -> Option<(Rect, Vec<(Rect, i32)>, f32)>;
 }
 
 /// Plain RGBA image (not premultiplied; screen captures are opaque).

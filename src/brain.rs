@@ -439,12 +439,14 @@ impl Brain for UtilityBrain {
     }
 
     fn whim_due(&self) -> bool {
-        self.whim_in <= 0.0
+        // Never in the middle of a fight or a reaction (it used to interrupt
+        // every punch mid-swing).
+        self.whim_in <= 0.0 && self.fight.is_none() && self.reaction.is_none()
     }
 
     fn decide(&mut self, p: &Perception, world: &World, rng: &mut Rng) -> Intent {
         let s = p.scale;
-        let Some(surf) = world.surface(p.support) else {
+        let Some(surf) = world.surface_near(p.support, p.foot.y) else {
             return Intent::Idle { secs: 0.5, fidget: Gesture::None };
         };
         if let Some((kind, intent)) = self.reaction.take() {

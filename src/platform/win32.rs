@@ -48,7 +48,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use super::uia::{Element, Reply, Request, Worker};
+use super::uia::{Element, PageBoxes, Reply, Request, Worker};
 use super::{Event, Image, MenuItem, Platform};
 use crate::math::{v2, Rect, Vec2};
 use crate::world::{Edge, Taskbar, WinId, WinInfo};
@@ -135,7 +135,8 @@ pub struct Win32Platform {
     uia: Option<Worker>,
     uia_failed: bool,
     buttons: Vec<(String, Rect)>,
-    elements: Vec<(usize, Vec<Element>)>,
+    elements: Vec<(usize, Vec<Element>, std::time::Instant)>,
+    pages: Vec<(usize, Option<PageBoxes>, std::time::Instant)>,
 }
 
 impl Win32Platform {
@@ -198,6 +199,7 @@ impl Win32Platform {
                 uia_failed: false,
                 buttons: Vec::new(),
                 elements: Vec::new(),
+                pages: Vec::new(),
             })
         }
     }
@@ -209,18 +211,31 @@ impl Win32Platform {
             self.uia_failed = self.uia.is_none();
         }
         let worker = self.uia.as_mut()?;
+        let mut clicks = Vec::new();
         while let Some(reply) = worker.poll() {
             match reply {
                 Reply::Taskbar(b) => self.buttons = b,
-                Reply::Elements(h, e) => {
-                    self.elements.retain(|(k, _)| *k != h);
-                    self.elements.push((h, e));
+                Reply::Elements(h, e, t) => {
+                    self.elements.retain(|(k, _, _)| *k != h);
+                    self.elements.push((h, e, t));
                     // Only remember a few windows.
                     if self.elements.len() > 4 {
                         self.elements.remove(0);
                     }
                 }
+                Reply::Page(h, p, t) => {
+                    self.pages.retain(|(k, _, _)| *k != h);
+                    self.pages.push((h, p, t));
+                    if self.pages.len() > 4 {
+                        self.pages.remove(0);
+                    }
+                }
+                Reply::InvokeFailed(h, at) => clicks.push((h, at)),
             }
+        }
+        // Couldn't press it the accessible way: click it instead.
+        for (h, at) in clicks {
+            self.post_click(h as WinId, at);
         }
         self.uia.as_mut()
     }
@@ -480,14 +495,34 @@ impl Platform for Win32Platform {
         self.buttons.clone()
     }
 
-    fn ui_elements(&mut self, id: WinId) -> Vec<(String, String, i32, Rect)> {
+    fn ui_elements(&mut self, id: WinId) -> (Vec<(String, String, i32, Rect)>, f32) {
         let h = id as usize;
         // Returns the last answer straight away and asks for a fresh one in
         // the background (the first call for a window returns nothing).
         if let Some(w) = self.uia() {
             w.request(Request::Elements(h));
         }
-        self.elements.iter().find(|(k, _)| *k == h).map(|(_, e)| e.clone()).unwrap_or_default()
+        match self.elements.iter().find(|(k, _, _)| *k == h) {
+            Some((_, e, t)) => (e.clone(), t.elapsed().as_secs_f32()),
+            None => (Vec::new(), f32::MAX),
+        }
+    }
+
+    fn press(&mut self, id: WinId, name_prefix: &str, at: Vec2) {
+        match self.uia() {
+            Some(w) => w.request(Request::Invoke(id as usize, name_prefix.to_string(), at)),
+            None => self.post_click(id, at),
+        }
+    }
+
+    fn page_boxes(&mut self, id: WinId) -> Option<(Rect, Vec<(Rect, i32)>, f32)> {
+        let h = id as usize;
+        if let Some(w) = self.uia() {
+            w.request(Request::Page(h));
+        }
+        let (_, page, t) = self.pages.iter().find(|(k, _, _)| *k == h)?;
+        let (doc, boxes) = page.as_ref()?;
+        Some((*doc, boxes.clone(), t.elapsed().as_secs_f32()))
     }
 
     fn window_title(&self, id: WinId) -> String {

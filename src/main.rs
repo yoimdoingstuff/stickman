@@ -361,14 +361,19 @@ fn main() {
             man.interrupt();
         }
 
-        // Thrown or flying fast into another stickman bowls it over.
+        // Thrown or flying fast into another stickman bowls it over (and
+        // the hit slows us down).
         body_hit_cooldown -= dt;
         let flying = man.is_ragdoll() || man.mode == Mode::Air;
-        if flying && body_hit_cooldown <= 0.0 && man.vel.len() > 900.0 * s {
-            let me = man.center();
-            for peer in peers.list.iter().filter(|p| !p.ragdoll && (p.hip - me).len() < 30.0 * s) {
-                peers.send_hit(peer.id, man.vel * 0.5);
-                body_hit_cooldown = 0.6;
+        if flying && body_hit_cooldown <= 0.0 && man.vel.len() > 600.0 * s {
+            let mine = man.body_rect();
+            let hit: Vec<u32> = peers.list.iter().filter(|p| !p.ragdoll && p.body.overlaps(&mine)).map(|p| p.id).collect();
+            if !hit.is_empty() {
+                for id in hit {
+                    peers.send_hit(id, man.vel * 0.55);
+                }
+                man.bounce(man.vel * -0.35);
+                body_hit_cooldown = 0.5;
             }
         }
 

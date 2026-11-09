@@ -216,7 +216,7 @@ pub fn ballistic(foot: Vec2, target: Vec2, extra: f32, g: f32) -> (Vec2, f32) {
 }
 
 fn anchor_for(world: &World, support: Support) -> Option<(Support, Vec2)> {
-    world.support_origin(support).map(|o| (support, o))
+    world.support_origin(support, None).map(|o| (support, o))
 }
 
 fn map_pose(p: &Pose, f: impl Fn(Vec2) -> Vec2) -> Pose {
@@ -336,7 +336,7 @@ impl Stickman {
     /// The window whose rectangle we need every frame (not just on refresh).
     pub fn attached_window(&self) -> Option<WinId> {
         match self.mode {
-            Mode::Ground(s) => s.window(),
+            Mode::Ground(s) => s.host(),
             Mode::Climb { win, .. } | Mode::Mantle { win, .. } => Some(win),
             Mode::Ragdoll => self.ragdoll.as_ref().and_then(|r| r.room),
             Mode::Air => self.pending_climb.map(|(id, _)| id).or(self.room),
@@ -421,6 +421,11 @@ impl Stickman {
     /// Head position and time, while asleep (for drawing Z's).
     pub fn zzz(&self) -> Option<(Vec2, f32)> {
         (self.sleeping && self.ragdoll.is_none()).then(|| (self.rig.pose.head, self.time))
+    }
+
+    /// The window it's walking around inside, if any.
+    pub fn room(&self) -> Option<WinId> {
+        self.room
     }
 
     pub fn is_ragdoll(&self) -> bool {
@@ -604,6 +609,14 @@ impl Stickman {
                     self.knock(v2(edge_speed * 0.5, -250.0 * s));
                 }
             }
+        }
+    }
+
+    /// Change speed without getting hurt (e.g. bouncing off someone we hit).
+    pub fn bounce(&mut self, dv: Vec2) {
+        match &mut self.ragdoll {
+            Some(r) => r.add_velocity(dv),
+            None => self.vel += dv,
         }
     }
 
@@ -911,7 +924,9 @@ impl Stickman {
         let room = r.room;
         let mut best: Option<Surface> = None;
         for s in world.surfaces() {
-            let allowed = world.can_land(&s, self.layer, None) || room.map(Support::Inside) == Some(s.support);
+            // Get up on real ground, not on another stickman's head.
+            let allowed = (world.can_land(&s, self.layer, None) || room.map(Support::Inside) == Some(s.support))
+                && !matches!(s.support, Support::Peer(_));
             if allowed
                 && hip.x >= s.x0 - 4.0
                 && hip.x <= s.x1 + 4.0
@@ -1033,7 +1048,8 @@ impl Stickman {
     /// footing (now falling or ragdolling).
     fn ride(&mut self, world: &World, support: Support, dt: f32) -> bool {
         let s = self.d.s;
-        let Some(o) = world.support_origin(support) else { return true };
+        let near = self.anchor.map(|(_, o)| o);
+        let Some(o) = world.support_origin(support, near) else { return true };
         let same = matches!(self.anchor, Some((prev, _)) if prev.window() == support.window() && (support.window().is_some() || prev == support));
         let Some((_, prev)) = self.anchor.filter(|_| same) else {
             self.support_vel = Vec2::ZERO;
@@ -1092,7 +1108,7 @@ impl Stickman {
     fn update_ground(&mut self, dt: f32, world: &World, support: Support, ev: &mut Events) -> RigState {
         let d = self.d;
         let s = d.s;
-        let Some(surf) = world.surface(support) else {
+        let Some(surf) = world.surface_near(support, self.pos.y + d.stance) else {
             // What we were standing on vanished (window minimized/closed):
             // sometimes we just drop, sometimes we go flailing.
             let vanished = support.window().is_some_and(|id| world.window(id).is_none());
@@ -1108,7 +1124,7 @@ impl Stickman {
         } else if !self.ride(world, support, dt) {
             return RigState::Air;
         }
-        if let (Support::Inside(id), false) = (support, self.force_front) {
+        if let (Support::Inside(id) | Support::Ledge { win: id, .. }, false) = (support, self.force_front) {
             self.layer = Layer::On(id);
         }
 
@@ -1118,7 +1134,7 @@ impl Stickman {
         self.wobble = (self.wobble - dt).max(0.0);
         let mut style = self.walk_style(WalkStyle::Normal);
         self.room = match support {
-            Support::Inside(id) => Some(id),
+            Support::Inside(id) | Support::Ledge { win: id, .. } => Some(id),
             _ => None,
         };
         if let Some(action) = self.action {
