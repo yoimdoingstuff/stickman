@@ -65,7 +65,50 @@ fn look_of(game: Game) -> Look {
     }
 }
 
+fn crash_log_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("stickman").join("crash.txt"))
+}
+
+/// Write any crash (panic) to %APPDATA%\stickman\crash.txt, so it doesn't
+/// just vanish without a trace.
+fn install_crash_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = crash_log_path() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let when = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let text = format!("stickman {} crashed (unix time {when}):\n{info}\n\n", env!("CARGO_PKG_VERSION"));
+            let old = std::fs::read_to_string(&path).unwrap_or_default();
+            // Keep the file small: newest crash first, a few kept.
+            let keep: String = old.chars().take(8000).collect();
+            let _ = std::fs::write(&path, text + &keep);
+        }
+        default(info);
+    }));
+}
+
+/// Run game-related code; if it panics, note it and carry on without it
+/// (the stickman shouldn't die because a game confused it).
+fn guarded<T>(enabled: &mut bool, f: impl FnOnce() -> T) -> Option<T> {
+    if !*enabled {
+        return None;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            *enabled = false;
+            None
+        }
+    }
+}
+
 fn main() {
+    install_crash_log();
     let mut plat = match platform::create() {
         Ok(p) => p,
         Err(e) => {
@@ -86,6 +129,8 @@ fn main() {
     let mut peers = Peers::new();
     let mut watcher = Watcher::default();
     let mut helper = Helper::new(&mut rng);
+    // Turned off for the rest of the session if the game code ever panics.
+    let mut games_ok = true;
 
     let spawn = v2(world.work.l + world.work.width() * rng.range(0.2, 0.8), world.work.t + 80.0 * s);
     let mut settings = Settings::load();
@@ -194,11 +239,13 @@ fn main() {
                         Some(MENU_MS_SNAPSHOT) => {
                             if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
                                 // Saves minesweeper.png + minesweeper.txt, then shows the folder.
-                                match helper.snapshot(&mut *plat, id, look_of(game)) {
-                                    Ok(dir) => {
+                                let mut ok = true;
+                                match guarded(&mut ok, || helper.snapshot(&mut *plat, id, look_of(game))) {
+                                    Some(Ok(dir)) => {
                                         let _ = std::process::Command::new("explorer").arg(dir).spawn();
                                     }
-                                    Err(e) => eprintln!("stickman: {e}"),
+                                    Some(Err(e)) => eprintln!("stickman: {e}"),
+                                    None => {}
                                 }
                             }
                         }
@@ -230,7 +277,8 @@ fn main() {
             world.taskbar = plat.taskbar();
             scan = WINDOW_SCAN;
             // Games opening, being won or lost.
-            for e in watcher.update(&*plat, &world) {
+            let events = guarded(&mut games_ok, || watcher.update(&*plat, &world)).unwrap_or_default();
+            for e in events {
                 if matches!(e, GameEvent::Finished(..)) {
                     man.interrupt();
                 }
@@ -326,14 +374,16 @@ fn main() {
 
         // Helping with Minesweeper while you play it.
         sweeper = None;
-        if settings.minesweeper_help && !paused {
+        if settings.minesweeper_help && !paused && games_ok {
             if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
                 if foreground == Some(id) {
                     let look = look_of(game);
                     sweeper = Some((id, look));
                     let ready = man.can_help();
                     let mistakes = settings.minesweeper_mistakes;
-                    if let Some(at) = helper.update(dt, &mut *plat, id, look, ready, mistakes, &mut rng) {
+                    let target =
+                        guarded(&mut games_ok, || helper.update(dt, &mut *plat, id, look, ready, mistakes, &mut rng)).flatten();
+                    if let Some(at) = target {
                         if !man.stomp(at, id) {
                             helper.cancel();
                         }
@@ -373,7 +423,9 @@ fn main() {
             }
             if ev.stomped {
                 match sweeper {
-                    Some((_, look)) => helper.stomped(&mut *plat, look, &mut rng),
+                    Some((_, look)) => {
+                        guarded(&mut games_ok, || helper.stomped(&mut *plat, look, &mut rng));
+                    }
                     None => helper.cancel(),
                 }
             }

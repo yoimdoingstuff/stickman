@@ -48,7 +48,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use super::uia::Uia;
+use super::uia::{Element, Reply, Request, Worker};
 use super::{Event, Image, MenuItem, Platform};
 use crate::math::{v2, Rect, Vec2};
 use crate::world::{Edge, Taskbar, WinId, WinInfo};
@@ -130,8 +130,12 @@ pub struct Win32Platform {
     shown: bool,
     /// The 16 "custom colours" slots in the picker, kept for the session.
     custom_colors: [u32; 16],
-    /// UI Automation, created the first time it's needed.
-    uia: Option<Uia>,
+    /// UI Automation background thread, started the first time it's needed,
+    /// and the latest answers it gave.
+    uia: Option<Worker>,
+    uia_failed: bool,
+    buttons: Vec<(String, Rect)>,
+    elements: Vec<(usize, Vec<Element>)>,
 }
 
 impl Win32Platform {
@@ -191,8 +195,34 @@ impl Win32Platform {
                 shown: false,
                 custom_colors: [0x00FF_FFFF; 16],
                 uia: None,
+                uia_failed: false,
+                buttons: Vec::new(),
+                elements: Vec::new(),
             })
         }
+    }
+
+    /// Start the UI Automation thread if needed and collect its answers.
+    fn uia(&mut self) -> Option<&mut Worker> {
+        if self.uia.is_none() && !self.uia_failed {
+            self.uia = Worker::spawn();
+            self.uia_failed = self.uia.is_none();
+        }
+        let worker = self.uia.as_mut()?;
+        while let Some(reply) = worker.poll() {
+            match reply {
+                Reply::Taskbar(b) => self.buttons = b,
+                Reply::Elements(h, e) => {
+                    self.elements.retain(|(k, _)| *k != h);
+                    self.elements.push((h, e));
+                    // Only remember a few windows.
+                    if self.elements.len() > 4 {
+                        self.elements.remove(0);
+                    }
+                }
+            }
+        }
+        self.uia.as_mut()
     }
 
     unsafe fn resize_buffer(&mut self, w: u32, h: u32) {
@@ -442,25 +472,22 @@ impl Platform for Win32Platform {
     }
 
     fn taskbar_buttons(&mut self) -> Vec<(String, Rect)> {
-        if self.uia.is_none() {
-            self.uia = Uia::new();
-        }
         let class = wide("Shell_TrayWnd");
-        let tray = unsafe { FindWindowW(class.as_ptr(), null()) };
-        match &self.uia {
-            Some(u) => u.taskbar_buttons(tray),
-            None => Vec::new(),
+        let tray = unsafe { FindWindowW(class.as_ptr(), null()) } as usize;
+        if let Some(w) = self.uia() {
+            w.request(Request::Taskbar(tray));
         }
+        self.buttons.clone()
     }
 
     fn ui_elements(&mut self, id: WinId) -> Vec<(String, String, i32, Rect)> {
-        if self.uia.is_none() {
-            self.uia = Uia::new();
+        let h = id as usize;
+        // Returns the last answer straight away and asks for a fresh one in
+        // the background (the first call for a window returns nothing).
+        if let Some(w) = self.uia() {
+            w.request(Request::Elements(h));
         }
-        match &self.uia {
-            Some(u) => u.elements(id as usize as HWND),
-            None => Vec::new(),
-        }
+        self.elements.iter().find(|(k, _)| *k == h).map(|(_, e)| e.clone()).unwrap_or_default()
     }
 
     fn window_title(&self, id: WinId) -> String {

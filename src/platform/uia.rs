@@ -1,16 +1,81 @@
-//! UI Automation: finds the app buttons on the taskbar. Works for the stock
-//! Windows 11 taskbar and for ExplorerPatcher's Windows 10-style taskbar,
-//! and skips everything that isn't an app (Start, search, tray icons, ...).
+//! UI Automation: finds the app buttons on the taskbar (works for the stock
+//! Windows 11 taskbar and ExplorerPatcher's Windows 10-style one) and the
+//! tiles inside game windows.
+//!
+//! Every UI Automation call is a slow round trip into another program, and
+//! some windows have thousands of elements, so all of it runs on a
+//! background thread: the stickman never waits for it.
 
 use std::ffi::c_void;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker, UIA_ButtonControlTypeId,
 };
 
 use crate::math::Rect;
+
+pub type Element = (String, String, i32, Rect);
+
+pub enum Request {
+    /// Taskbar window handle.
+    Taskbar(usize),
+    /// Window handle to list the elements of.
+    Elements(usize),
+}
+
+pub enum Reply {
+    Taskbar(Vec<(String, Rect)>),
+    Elements(usize, Vec<Element>),
+}
+
+/// The background thread that does the UI Automation work.
+pub struct Worker {
+    tx: Sender<Request>,
+    rx: Receiver<Reply>,
+    busy: bool,
+}
+
+impl Worker {
+    pub fn spawn() -> Option<Self> {
+        let (tx, requests) = channel::<Request>();
+        let (replies, rx) = channel::<Reply>();
+        std::thread::Builder::new()
+            .name("ui-automation".into())
+            .spawn(move || {
+                let Some(uia) = Uia::new() else { return };
+                while let Ok(req) = requests.recv() {
+                    let reply = match req {
+                        Request::Taskbar(h) => Reply::Taskbar(uia.taskbar_buttons(h as *mut c_void)),
+                        Request::Elements(h) => Reply::Elements(h, uia.elements(h as *mut c_void)),
+                    };
+                    if replies.send(reply).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Worker { tx, rx, busy: false })
+    }
+
+    /// Ask for something, unless it's still working on the last request.
+    pub fn request(&mut self, r: Request) {
+        if !self.busy {
+            self.busy = self.tx.send(r).is_ok();
+        }
+    }
+
+    /// A finished answer, if there is one.
+    pub fn poll(&mut self) -> Option<Reply> {
+        let r = self.rx.try_recv().ok();
+        if r.is_some() {
+            self.busy = false;
+        }
+        r
+    }
+}
 
 /// Windows 11: each app button has this class.
 const WIN11_BUTTON: &str = "Taskbar.TaskListButtonAutomationPeer";
@@ -28,8 +93,8 @@ pub struct Uia {
 impl Uia {
     pub fn new() -> Option<Self> {
         unsafe {
-            // Fine if COM was already initialised.
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            // Fine if COM was already initialised on this thread.
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let auto: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
             let walker = auto.ControlViewWalker().ok()?;
             Some(Uia { auto, walker })
@@ -52,7 +117,7 @@ impl Uia {
 
     /// Every element inside a window: (name, class name, control type id,
     /// screen rect). Used to find game tiles and for diagnostics.
-    pub fn elements(&self, hwnd: *mut c_void) -> Vec<(String, String, i32, Rect)> {
+    pub fn elements(&self, hwnd: *mut c_void) -> Vec<Element> {
         let mut out = Vec::new();
         if hwnd.is_null() {
             return out;
@@ -65,7 +130,7 @@ impl Uia {
                 Err(_) => return out,
             };
             while let Some((el, depth)) = stack.pop() {
-                if out.len() > 3000 || depth > 12 {
+                if out.len() > 2000 || depth > 12 {
                     continue;
                 }
                 let name = el.CurrentName().map(|b| b.to_string()).unwrap_or_default();

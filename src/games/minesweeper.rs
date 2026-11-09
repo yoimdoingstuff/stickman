@@ -583,7 +583,8 @@ impl Helper {
         let client = plat.client_rect(game).unwrap_or(Rect { l: 0.0, t: 0.0, r: 0.0, b: 0.0 });
         let stale = !matches!(self.uia_grid, Some((id, r, _)) if id == game && r == client);
         if stale && self.uia_checked <= 0.0 {
-            self.uia_checked = 3.0;
+            // The answer arrives in the background; this picks up the last one.
+            self.uia_checked = 1.0;
             let rects: Vec<Rect> = plat.ui_elements(game).into_iter().map(|e| e.3).collect();
             self.uia_grid = grid_from_elements(&rects).map(|g| (game, client, g));
         }

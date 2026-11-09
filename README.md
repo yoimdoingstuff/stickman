@@ -103,6 +103,10 @@ stretches, scratches its head, or crosses its arms and taps its foot when
 bored. When tired it naps (with floating Z's) or meditates; with energy to
 spare it does push-ups, shadowboxes or practises kicks.
 
+If it ever crashes, the reason is written to `%APPDATA%\stickman\crash.txt`
+(newest first). Problems in the game helpers just switch those off for the
+rest of the session instead of taking the stickman down.
+
 Settings are saved to `%APPDATA%\stickman\settings.txt`:
 
 ```
