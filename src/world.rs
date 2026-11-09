@@ -1,7 +1,7 @@
 //! What the stickman knows about the desktop: the work area and the
 //! open windows (in z-order), plus the surfaces and walls they create.
 
-use crate::math::Rect;
+use crate::math::{Rect, Vec2};
 
 pub type WinId = u64;
 
@@ -18,6 +18,17 @@ pub enum Support {
     Floor,
     /// The top edge of a window.
     Window(WinId),
+    /// The bottom edge, *inside* a window (walking around in it).
+    Inside(WinId),
+}
+
+impl Support {
+    pub fn window(self) -> Option<WinId> {
+        match self {
+            Support::Floor => None,
+            Support::Window(id) | Support::Inside(id) => Some(id),
+        }
+    }
 }
 
 /// A horizontal line you can stand on.
@@ -27,6 +38,8 @@ pub struct Surface {
     pub x0: f32,
     pub x1: f32,
     pub y: f32,
+    /// Ends are walls (inside a window) rather than ledges you fall off.
+    pub walled: bool,
 }
 
 /// Which side wall of a window.
@@ -57,6 +70,17 @@ pub enum Layer {
     On(WinId),
 }
 
+impl Layer {
+    /// The layer you're on when standing on `support`.
+    pub fn for_support(support: Support, current: Layer) -> Layer {
+        match support {
+            Support::Window(id) | Support::Inside(id) => Layer::On(id),
+            Support::Floor if current == Layer::Behind => Layer::Behind,
+            Support::Floor => Layer::Front,
+        }
+    }
+}
+
 pub struct World {
     pub work: Rect,
     /// Windows ordered top-most first.
@@ -75,6 +99,7 @@ impl World {
                 x0: self.work.l,
                 x1: self.work.r,
                 y: self.work.b,
+                walled: false,
             }),
             Support::Window(id) => {
                 let r = self.window(id)?.rect;
@@ -84,18 +109,48 @@ impl World {
                 if x1 - x0 < 30.0 || r.t < self.work.t + 60.0 || r.t > self.work.b - 30.0 {
                     return None;
                 }
-                Some(Surface { support, x0, x1, y: r.t })
+                Some(Surface { support, x0, x1, y: r.t, walled: false })
+            }
+            Support::Inside(id) => {
+                let r = self.window(id)?.rect;
+                let x0 = r.l.max(self.work.l) + 6.0;
+                let x1 = r.r.min(self.work.r) - 6.0;
+                let y = (r.b - 3.0).min(self.work.b);
+                // Big enough to be a room, and the floor is on screen.
+                if x1 - x0 < 120.0 || y - r.t.max(self.work.t) < 140.0 {
+                    return None;
+                }
+                Some(Surface { support, x0, x1, y, walled: true })
             }
         }
     }
 
     pub fn surfaces(&self) -> Vec<Surface> {
-        let mut out = Vec::with_capacity(self.windows.len() + 1);
+        let mut out = Vec::with_capacity(self.windows.len() * 2 + 1);
         out.extend(self.surface(Support::Floor));
         for w in &self.windows {
             out.extend(self.surface(Support::Window(w.id)));
+            out.extend(self.surface(Support::Inside(w.id)));
         }
         out
+    }
+
+    /// Window interiors only catch you if you're already in that window's
+    /// layer or deliberately aiming for them; otherwise you'd get "stuck"
+    /// inside every window you fall past.
+    pub fn can_land(&self, s: &Surface, layer: Layer, target: Option<Support>) -> bool {
+        match s.support {
+            Support::Inside(id) => layer == Layer::On(id) || target == Some(s.support),
+            _ => true,
+        }
+    }
+
+    /// Top-most window containing a point.
+    pub fn window_at(&self, p: Vec2) -> Option<WinId> {
+        self.windows
+            .iter()
+            .find(|w| p.x >= w.rect.l && p.x <= w.rect.r && p.y >= w.rect.t && p.y <= w.rect.b)
+            .map(|w| w.id)
     }
 
     /// X coordinate of a window's side wall, if it is on screen.

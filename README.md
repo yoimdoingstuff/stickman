@@ -17,15 +17,28 @@ To build locally instead: install Rust (https://rustup.rs) and run
 
 ## Use
 
-- **Left-drag** the stickman to pick it up and throw it.
-- **Right-click** it for the menu: stay in front, pause, come here,
-  change colour, quit.
+- **Left-drag** any part of the stickman to pick it up by that limb (it goes
+  ragdoll). Throw it hard and it flops; drop it gently and it lands on its feet.
+- **Drop it onto a window** and it lives inside that window, walking along
+  its bottom edge until it decides to jump out.
+- **Right-click** it for the menu: ragdoll, come here, stay in front, allow
+  cursor grabbing, pause, change colour, outline on/off, quit.
+- **Run `stickman.exe` more than once** (up to 16) and the stickmen notice
+  each other: they wander over, wave, punch, hold grudges, and knock each
+  other over when thrown into one another. They talk over UDP on
+  `127.0.0.1` only, so nothing leaves your PC.
+
+On its own it walks, runs, sits, dances, waves, backflips, jumps between
+windows, climbs window sides, walks behind windows, hops into windows, and
+jumps up to hang off your mouse cursor (shake the mouse to fling it off).
 
 Settings are saved to `%APPDATA%\stickman\settings.txt`:
 
 ```
 color=#000000
+outline=true
 stay_in_front=false
+grab_cursor=true
 ```
 
 Any colour works. Dark colours get a light outline and light colours a dark
@@ -39,6 +52,9 @@ one, so it stays visible on any background.
 | `src/world.rs` | Turns windows into surfaces (top edges), walls (side edges) and occluders (windows above the stickman's layer). |
 | `src/stickman.rs` | Body physics and actions: walk, jump (ballistic, aimed at a landing spot), climb, mantle, drag/throw. |
 | `src/rig.rs` | Procedural animation: planted feet/hands that step when they drift too far, two-bone IK for knees/elbows, springs for lean, squash and dangling limbs. No keyframes. |
+| `src/ragdoll.rs` | Verlet ragdoll: joints are particles, bones are distance constraints, with pins for dragging and cursor-hanging. |
+| `src/peers.rs` | Finds other running stickmen over localhost UDP and sends/receives hits. |
+| `src/settings.rs` | Loads/saves the settings file. |
 | `src/render.rs` | Draws the pose with tiny-skia. |
 | `src/brain.rs` | `Brain` trait + a utility AI with personality and needs (boredom, energy). Meant to be swapped for a small trained model later. |
 

@@ -12,12 +12,12 @@ pub struct Style {
     body: [u8; 4],
     /// Far-side arm and leg, slightly shifted so the limbs read as separate.
     back: [u8; 4],
-    /// Thin rim so the stickman is visible on any background.
-    outline: [u8; 4],
+    /// Thin rim so the stickman is visible on any background (optional).
+    outline: Option<[u8; 4]>,
 }
 
 impl Style {
-    pub fn from_color(c: [u8; 3]) -> Self {
+    pub fn new(c: [u8; 3], outline: bool) -> Self {
         let lum = (0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32) / 255.0;
         let dark = lum < 0.45;
         let mix = |v: u8| {
@@ -27,7 +27,7 @@ impl Style {
         Style {
             body: [c[0], c[1], c[2], 255],
             back: [mix(c[0]), mix(c[1]), mix(c[2]), 255],
-            outline: if dark { [240, 240, 240, 200] } else { [22, 18, 18, 240] },
+            outline: outline.then_some(if dark { [240, 240, 240, 200] } else { [22, 18, 18, 240] }),
         }
     }
 }
@@ -78,7 +78,9 @@ pub fn draw(pm: &mut Pixmap, pose: &Pose, origin: Vec2, d: &Dims, style: &Style)
 
     let limb = |pm: &mut Pixmap, pts: &[Vec2], col: [u8; 4]| {
         let pts: Vec<Vec2> = pts.iter().map(|&v| p(v)).collect();
-        polyline(pm, &pts, ow, style.outline);
+        if let Some(o) = style.outline {
+            polyline(pm, &pts, ow, o);
+        }
         polyline(pm, &pts, w, col);
     };
 
@@ -86,7 +88,9 @@ pub fn draw(pm: &mut Pixmap, pose: &Pose, origin: Vec2, d: &Dims, style: &Style)
     limb(pm, &[pose.hip, pose.knees[0], pose.feet[0]], style.back);
     limb(pm, &[pose.chest, pose.elbows[0], pose.hands[0]], style.back);
     limb(pm, &[pose.hip, pose.chest, pose.neck], style.body);
-    circle(pm, p(pose.head), d.head_r + 1.2 * s, style.outline);
+    if let Some(o) = style.outline {
+        circle(pm, p(pose.head), d.head_r + 1.2 * s, o);
+    }
     circle(pm, p(pose.head), d.head_r, style.body);
     limb(pm, &[pose.hip, pose.knees[1], pose.feet[1]], style.body);
     limb(pm, &[pose.chest, pose.elbows[1], pose.hands[1]], style.body);

@@ -9,13 +9,22 @@ use std::f32::consts::{PI, TAU};
 use crate::math::*;
 use crate::stickman::Dims;
 
+/// Upper-body moves layered on top of standing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Gesture {
+    None,
+    Wave,
+    Dance,
+    /// -1..0 = winding up, 0..1 = arm extended.
+    Punch(f32),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum RigState {
-    Stand { ground_y: f32, sit: bool, wave: bool },
+    Stand { ground_y: f32, sit: bool, gesture: Gesture },
     Air,
     Climb { wall_x: f32 },
     Mantle { wall_x: f32, top_y: f32 },
-    Held,
 }
 
 impl RigState {
@@ -25,7 +34,6 @@ impl RigState {
             RigState::Air => 1,
             RigState::Climb { .. } => 2,
             RigState::Mantle { .. } => 3,
-            RigState::Held => 4,
         }
     }
 }
@@ -190,6 +198,22 @@ impl Rig {
         }
     }
 
+    /// Take over from a ragdoll: limbs start where the ragdoll left them and
+    /// the springs pull the body back upright, which reads as getting up.
+    pub fn adopt(&mut self, pose: &Pose) {
+        for i in 0..2 {
+            self.feet[i] = Limb { pos: pose.feet[i], ..Limb::default() };
+            self.hands[i] = Limb { pos: pose.hands[i], ..Limb::default() };
+        }
+        let up = pose.chest - pose.hip;
+        let angle = up.x.atan2(-up.y);
+        self.lean = Spring { x: angle, v: 0.0 };
+        self.tilt = Spring { x: angle, v: 0.0 };
+        self.kind = 255;
+        self.init = true;
+        self.pose = *pose;
+    }
+
     /// Squash on landing, proportional to how hard we hit.
     pub fn on_land(&mut self, impact: f32) {
         self.squash.v += (impact * 0.16).min(380.0);
@@ -201,6 +225,11 @@ impl Rig {
         let t = inp.time;
         let kind = inp.state.kind();
         let snap = kind != self.kind && self.init;
+        let gesture = match inp.state {
+            RigState::Stand { gesture, .. } => gesture,
+            _ => Gesture::None,
+        };
+        let dance = gesture == Gesture::Dance;
         self.kind = kind;
 
         if !self.init {
@@ -235,7 +264,8 @@ impl Rig {
                     * (1.0 + run * 1.5)
                     * s
                     + (t * 2.1).sin() * 0.4 * s * (1.0 - run);
-                hip.y += drop + bob;
+                let groove = if dance { -(t * 7.0).sin().abs() * 2.5 * s } else { 0.0 };
+                hip.y += drop + bob + groove;
                 hip.x -= f * self.crouch.x * 2.0 * s;
 
                 if sitk > 0.5 {
@@ -244,7 +274,13 @@ impl Rig {
                 } else {
                     let moving = speed > 15.0 * s;
                     let base = inp.hip.x + inp.vel.x * 0.1;
-                    let spread = if moving { 0.0 } else { 4.5 * s };
+                    let spread = if moving {
+                        0.0
+                    } else if dance {
+                        4.5 * s * (1.0 + 0.8 * (t * 3.5).sin())
+                    } else {
+                        4.5 * s
+                    };
                     let ideal = [v2(base - spread, ground_y), v2(base + spread, ground_y)];
                     let threshold = if moving { 8.0 * s + speed * 0.05 } else { 3.0 * s };
                     let dur = (0.26 - speed / s * 0.000_38).clamp(0.11, 0.26);
@@ -253,7 +289,9 @@ impl Rig {
                     step_pair(&mut self.feet, ideal, lead, threshold, dur, lift, snap, dt);
                 }
                 lean_target = (inp.vel.x / s * 0.0008).clamp(-0.32, 0.32) + f * self.crouch.x * 0.3
-                    - f * sitk * 0.05;
+                    - f * sitk * 0.05
+                    + (if dance { (t * 3.5).sin() * 0.15 } else { 0.0 })
+                    + (if let Gesture::Punch(e) = gesture { f * e * 0.15 } else { 0.0 });
             }
             RigState::Air => {
                 for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
@@ -279,13 +317,6 @@ impl Rig {
                 }
                 lean_target = f * 0.4;
             }
-            RigState::Held => {
-                for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
-                    let target = hip + v2(-inp.vel.x * 0.012 + side * 3.0 * s, 27.0 * s);
-                    self.feet[i].follow(target, 2.2, 0.22, dt);
-                }
-                lean_target = (-inp.vel.x / s * 0.0006).clamp(-0.5, 0.5);
-            }
         }
 
         // ---- spine and head ----
@@ -305,9 +336,10 @@ impl Rig {
         let arm = d.arm();
         let mut elbow_bend = -f;
         match inp.state {
-            RigState::Stand { wave, .. } => {
+            RigState::Stand { .. } => {
                 let sitk = self.sit.x.clamp(0.0, 1.0);
                 for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
+                    let fi = i as f32;
                     let swing = (self.feet[1 - i].pos.x - hip.x) * 0.75;
                     let mut target = chest
                         + v2(
@@ -318,10 +350,31 @@ impl Rig {
                     if sitk > 0.3 {
                         target = target.lerp(self.pose.knees[i] + v2(0.0, -s), sitk);
                     }
-                    if wave && i == 1 {
-                        target = chest + v2(f * 7.0 * s + (t * 13.0).sin() * 5.0 * s, -17.0 * s);
+                    let mut freq = 5.5;
+                    match gesture {
+                        Gesture::Wave if i == 1 => {
+                            target = chest + v2(f * 7.0 * s + (t * 13.0).sin() * 5.0 * s, -17.0 * s);
+                        }
+                        Gesture::Dance => {
+                            let ph = t * 7.0 + fi * PI;
+                            target = chest + v2(side * 9.0 * s + ph.sin() * 3.0 * s, -13.0 * s + ph.sin() * 6.0 * s);
+                        }
+                        Gesture::Punch(e) if i == 1 => {
+                            target = if e < 0.0 {
+                                chest + v2(-f * 9.0 * s * -e, 3.0 * s)
+                            } else {
+                                chest + v2(f * (arm * 0.95 * e + 2.0 * s * (1.0 - e)), -2.0 * s)
+                            };
+                            freq = 12.0;
+                        }
+                        Gesture::Punch(_) => {
+                            // Guard hand up.
+                            target = chest + v2(f * 6.0 * s, 1.0 * s);
+                            freq = 8.0;
+                        }
+                        _ => {}
                     }
-                    self.hands[i].follow(target, 5.5, 0.55, dt);
+                    self.hands[i].follow(target, freq, 0.6, dt);
                 }
             }
             RigState::Air => {
@@ -349,12 +402,6 @@ impl Rig {
                 for i in 0..2 {
                     let target = v2(wall_x + f * (3.0 + i as f32 * 5.0) * s, top_y);
                     self.hands[i].follow(target, 9.0, 0.8, dt);
-                }
-            }
-            RigState::Held => {
-                for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
-                    let target = chest + v2(-inp.vel.x * 0.01 + side * 4.0 * s, 19.0 * s);
-                    self.hands[i].follow(target, 2.4, 0.22, dt);
                 }
             }
         }

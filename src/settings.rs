@@ -6,12 +6,16 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Body colour as RGB.
     pub color: [u8; 3],
+    /// Draw a contrasting rim around the body.
+    pub outline: bool,
     pub stay_in_front: bool,
+    /// Allow it to jump up and hang off your mouse cursor.
+    pub grab_cursor: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { color: [0, 0, 0], stay_in_front: false }
+        Settings { color: [0, 0, 0], outline: true, stay_in_front: false, grab_cursor: true }
     }
 }
 
@@ -40,13 +44,16 @@ impl Settings {
         };
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
+            let flag = value.trim() == "true";
             match key.trim() {
                 "color" => {
                     if let Some(c) = parse_hex(value) {
                         s.color = c;
                     }
                 }
-                "stay_in_front" => s.stay_in_front = value.trim() == "true",
+                "outline" => s.outline = flag,
+                "stay_in_front" => s.stay_in_front = flag,
+                "grab_cursor" => s.grab_cursor = flag,
                 _ => {}
             }
         }
@@ -58,7 +65,13 @@ impl Settings {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = format!("color={}\nstay_in_front={}\n", to_hex(self.color), self.stay_in_front);
+        let text = format!(
+            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\n",
+            to_hex(self.color),
+            self.outline,
+            self.stay_in_front,
+            self.grab_cursor
+        );
         let _ = std::fs::write(p, text);
     }
 }
