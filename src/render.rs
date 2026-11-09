@@ -2,7 +2,7 @@
 
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-use crate::math::Vec2;
+use crate::math::{v2, Vec2};
 use crate::rig::Pose;
 use crate::stickman::Dims;
 
@@ -66,7 +66,23 @@ fn circle(pm: &mut Pixmap, c: Vec2, r: f32, col: [u8; 4]) {
     }
 }
 
-pub fn draw(pm: &mut Pixmap, pose: &Pose, origin: Vec2, d: &Dims, style: &Style) {
+/// Little "z" letters drifting up from the head while asleep.
+fn draw_zzz(pm: &mut Pixmap, head: Vec2, time: f32, d: &Dims, style: &Style) {
+    let s = d.s;
+    for k in 0..3 {
+        let phase = (time * 0.45 + k as f32 / 3.0).fract();
+        let c = head + v2((5.0 + phase * 10.0) * s, -(9.0 + phase * 22.0) * s);
+        let r = (1.8 + phase * 2.4) * s;
+        let alpha = ((1.0 - phase) * 255.0) as u8;
+        let pts = [c + v2(-r, -r), c + v2(r, -r), c + v2(-r, r), c + v2(r, r)];
+        if let Some(o) = style.outline {
+            polyline(pm, &pts, 1.6 * s + 2.0 * s, [o[0], o[1], o[2], (o[3] as f32 * (1.0 - phase)) as u8]);
+        }
+        polyline(pm, &pts, 1.6 * s, [style.body[0], style.body[1], style.body[2], alpha]);
+    }
+}
+
+pub fn draw(pm: &mut Pixmap, pose: &Pose, origin: Vec2, d: &Dims, style: &Style, zzz: Option<(Vec2, f32)>) {
     pm.fill(Color::TRANSPARENT);
     let p = |v: Vec2| v - origin;
     let s = d.s;
@@ -94,4 +110,8 @@ pub fn draw(pm: &mut Pixmap, pose: &Pose, origin: Vec2, d: &Dims, style: &Style)
     circle(pm, p(pose.head), d.head_r, style.body);
     limb(pm, &[pose.hip, pose.knees[1], pose.feet[1]], style.body);
     limb(pm, &[pose.chest, pose.elbows[1], pose.hands[1]], style.body);
+
+    if let Some((head, time)) = zzz {
+        draw_zzz(pm, p(head), time, d, style);
+    }
 }

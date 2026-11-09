@@ -3,16 +3,22 @@
 //! from a weights file) without touching the body or animation code.
 
 use crate::math::*;
+use crate::rig::Gesture;
 use crate::rng::Rng;
 use crate::world::*;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Intent {
-    Idle { secs: f32 },
+    /// Stand around, optionally fidgeting.
+    Idle { secs: f32, fidget: Gesture },
     Walk { x: f32, speed: f32 },
     Sit { secs: f32 },
-    Wave { secs: f32 },
-    Dance { secs: f32 },
+    /// Hold a gesture: wave, dance, sleep, push-ups, meditate, shadowbox...
+    Pose { secs: f32, gesture: Gesture },
+    Kick { target: Option<u32>, dir: f32 },
+    /// Sit on the ledge at `edge`, facing `dir` (toward the drop).
+    EdgeSit { secs: f32, edge: f32, dir: f32 },
+    Cartwheel,
     /// Jump so the feet land at `target` on `support`.
     Jump { target: Vec2, support: Support },
     Flip,
@@ -78,6 +84,13 @@ enum Kind {
     Cursor,
     Approach,
     Punch,
+    Kick,
+    Sleep,
+    PushUps,
+    Box,
+    Meditate,
+    EdgeSit,
+    Cartwheel,
 }
 
 /// Fixed traits, rolled once per stickman. All 0..1.
@@ -144,11 +157,12 @@ impl UtilityBrain {
                 n.energy -= 0.1;
                 n.boredom -= 0.35;
             }
-            Kind::Run | Kind::Dance => {
+            Kind::Run | Kind::Dance | Kind::PushUps | Kind::Box | Kind::Cartwheel => {
                 n.energy -= 0.06;
                 n.boredom -= 0.25;
             }
-            Kind::Punch => {
+            Kind::Sleep | Kind::Meditate | Kind::EdgeSit => n.boredom -= 0.1,
+            Kind::Punch | Kind::Kick => {
                 n.boredom -= 0.3;
                 if let Some((_, g)) = &mut self.grudge {
                     *g -= 0.35;
@@ -172,7 +186,11 @@ impl Brain for UtilityBrain {
     fn tick(&mut self, dt: f32) {
         let n = &mut self.needs;
         match self.current {
-            Kind::Sit => {
+            Kind::Sleep => {
+                n.energy += 0.1 * dt;
+                n.boredom += 0.01 * dt;
+            }
+            Kind::Sit | Kind::Meditate | Kind::EdgeSit => {
                 n.energy += 0.05 * dt;
                 n.boredom += 0.015 * dt;
             }
@@ -216,7 +234,7 @@ impl Brain for UtilityBrain {
     fn decide(&mut self, p: &Perception, world: &World, rng: &mut Rng) -> Intent {
         let s = p.scale;
         let Some(surf) = world.surface(p.support) else {
-            return Intent::Idle { secs: 0.5 };
+            return Intent::Idle { secs: 0.5, fidget: Gesture::None };
         };
         let pers = self.personality;
         let (b, e) = (self.needs.boredom, self.needs.energy);
@@ -224,18 +242,68 @@ impl Brain for UtilityBrain {
         let mut options: Vec<(Kind, Intent, f32)> = Vec::new();
         let inside = matches!(p.support, Support::Inside(_));
 
-        options.push((Kind::Idle, Intent::Idle { secs: rng.range(0.8, 2.5) }, 0.35 + pers.laziness * 0.3 - b * 0.35));
+        // Idle, with a random fidget (or just looking around).
+        let fidget = match (rng.f32() * 7.0) as u32 {
+            0 => Gesture::Stretch,
+            1 => Gesture::Scratch,
+            2 if b > 0.4 => Gesture::TapFoot,
+            _ => Gesture::None,
+        };
+        let idle_secs = if fidget == Gesture::None { rng.range(1.0, 3.5) } else { rng.range(1.5, 3.0) };
+        options.push((
+            Kind::Idle,
+            Intent::Idle { secs: idle_secs, fidget },
+            0.35 + pers.laziness * 0.3 - b * 0.35,
+        ));
         options.push((
             Kind::Sit,
             Intent::Sit { secs: rng.range(3.0, 9.0) },
             (1.0 - e) * 0.9 + pers.laziness * 0.2 - b * 0.25,
         ));
+        let pose = |secs: f32, gesture: Gesture| Intent::Pose { secs, gesture };
+        options.push((
+            Kind::Sleep,
+            pose(rng.range(6.0, 14.0), Gesture::Sleep),
+            (1.0 - e) * 1.1 + pers.laziness * 0.3 - b * 0.3 - 0.35,
+        ));
+        options.push((
+            Kind::Meditate,
+            pose(rng.range(4.0, 8.0), Gesture::Meditate),
+            0.06 + (1.0 - pers.mischief) * 0.2 + (1.0 - e) * 0.2,
+        ));
         options.push((
             Kind::Dance,
-            Intent::Dance { secs: rng.range(2.0, 4.5) },
+            pose(rng.range(2.0, 4.5), Gesture::Dance),
             (0.08 + pers.playfulness * 0.3 + b * 0.15) * ef,
         ));
+        options.push((
+            Kind::PushUps,
+            pose(rng.range(3.0, 5.0), Gesture::PushUp),
+            (0.08 + pers.playfulness * 0.2 + b * 0.2) * e,
+        ));
+        options.push((
+            Kind::Box,
+            pose(rng.range(1.5, 3.0), Gesture::Box),
+            (0.08 + pers.mischief * 0.25 + b * 0.15) * ef,
+        ));
+        let kick_dir = if rng.chance(0.5) { 1.0 } else { -1.0 };
+        options.push((Kind::Kick, Intent::Kick { target: None, dir: kick_dir }, (0.06 + pers.mischief * 0.2) * ef));
         options.push((Kind::Flip, Intent::Flip, (0.1 + pers.playfulness * 0.35) * ef));
+        // Cartwheel only if there's room ahead on this surface (either way).
+        let wheel_dir = if rng.chance(0.5) { 1.0 } else { -1.0 };
+        let land_x = p.hip.x + wheel_dir * 90.0 * s;
+        if land_x > surf.x0 + 10.0 * s && land_x < surf.x1 - 10.0 * s {
+            options.push((Kind::Cartwheel, Intent::Cartwheel, (0.08 + pers.playfulness * 0.3) * ef));
+        }
+        // Sit on the edge of the window we're standing on, legs over the side.
+        if let Support::Window(_) = p.support {
+            let (edge, dir) = if p.hip.x - surf.x0 < surf.x1 - p.hip.x { (surf.x0, -1.0) } else { (surf.x1, 1.0) };
+            options.push((
+                Kind::EdgeSit,
+                Intent::EdgeSit { secs: rng.range(4.0, 10.0), edge, dir },
+                0.15 + pers.laziness * 0.3 + pers.curiosity * 0.1,
+            ));
+        }
 
         let margin = 14.0 * s;
         if surf.x1 - surf.x0 > margin * 3.0 {
@@ -362,6 +430,13 @@ impl Brain for UtilityBrain {
                     Intent::Punch { target: peer.id, dir },
                     0.1 + pers.mischief * 0.5 + grudge * 0.8,
                 ));
+            }
+            if dx.abs() < 34.0 * s {
+                options.push((
+                    Kind::Kick,
+                    Intent::Kick { target: Some(peer.id), dir },
+                    0.08 + pers.mischief * 0.4 + grudge * 0.7,
+                ));
             } else if dx.abs() < 600.0 * s && peer.hip.x > surf.x0 && peer.hip.x < surf.x1 {
                 let speed = if grudge > 0.2 { 300.0 } else { 120.0 } * s;
                 options.push((
@@ -371,13 +446,13 @@ impl Brain for UtilityBrain {
                 ));
             }
         }
-        options.push((Kind::Wave, Intent::Wave { secs: rng.range(1.2, 2.2) }, wave));
+        options.push((Kind::Wave, pose(rng.range(1.2, 2.2), Gesture::Wave), wave));
 
         if p.support == Support::Floor && !world.windows.is_empty() {
             options.push((Kind::Layer, Intent::ToggleLayer, 0.08 + pers.mischief * 0.25));
         }
 
-        let mut best = (Kind::Idle, Intent::Idle { secs: 1.0 }, f32::MIN);
+        let mut best = (Kind::Idle, Intent::Idle { secs: 1.0, fidget: Gesture::None }, f32::MIN);
         for (kind, intent, score) in options {
             let repeats = self.history.iter().filter(|h| **h == kind).count() as i32;
             let score = score * 0.6f32.powi(repeats) + rng.f32() * 0.3;

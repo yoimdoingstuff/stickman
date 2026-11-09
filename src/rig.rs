@@ -17,6 +17,28 @@ pub enum Gesture {
     Dance,
     /// -1..0 = winding up, 0..1 = arm extended.
     Punch(f32),
+    /// -1..0 = chambering the knee, 0..1 = leg extended.
+    Kick(f32),
+    /// Arms up over the head.
+    Stretch,
+    Scratch,
+    /// Arms crossed, tapping a foot.
+    TapFoot,
+    /// Shadowboxing jabs.
+    Box,
+    /// Floating cross-legged.
+    Meditate,
+    PushUp,
+    Sleep,
+    /// Sitting on a ledge with legs dangling over it (facing the drop).
+    EdgeSit,
+}
+
+impl Gesture {
+    /// Poses that bring the hips down to the ground.
+    fn is_low(self) -> bool {
+        matches!(self, Gesture::Meditate | Gesture::PushUp | Gesture::Sleep | Gesture::EdgeSit)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,7 +264,8 @@ impl Rig {
 
         self.crouch.update(inp.crouch, 5.0, 0.7, dt);
         self.squash.update(0.0, 4.5, 0.45, dt);
-        let sitting = matches!(inp.state, RigState::Stand { sit: true, .. });
+        let sitting = matches!(inp.state, RigState::Stand { sit: true, .. }) || gesture.is_low();
+        let pump = 0.5 + 0.5 * (t * 4.5).sin();
         self.sit.update(if sitting { 1.0 } else { 0.0 }, 2.2, 0.9, dt);
 
         let speed = inp.vel.x.abs();
@@ -265,10 +288,33 @@ impl Rig {
                     * s
                     + (t * 2.1).sin() * 0.4 * s * (1.0 - run);
                 let groove = if dance { -(t * 7.0).sin().abs() * 2.5 * s } else { 0.0 };
-                hip.y += drop + bob + groove;
+                // Fine-tune hip height for the low poses (relative to sitting).
+                let low = sitk
+                    * match gesture {
+                        Gesture::Sleep => 4.0 * s,
+                        Gesture::PushUp => 2.0 * s - pump * 5.0 * s,
+                        Gesture::Meditate => -(5.0 + (t * 1.6).sin() * 2.0) * s,
+                        Gesture::EdgeSit => 4.0 * s,
+                        _ => 0.0,
+                    };
+                hip.y += drop + bob + groove + low;
                 hip.x -= f * self.crouch.x * 2.0 * s;
 
-                if sitk > 0.5 {
+                if sitk > 0.5 && gesture.is_low() {
+                    for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
+                        let fi = i as f32;
+                        let target = match gesture {
+                            Gesture::Sleep => v2(hip.x + f * (25.0 + fi * 2.0) * s, ground_y - s),
+                            Gesture::PushUp => v2(hip.x - f * (26.0 + fi * 2.0) * s, ground_y - s),
+                            Gesture::Meditate => hip + v2(side * 7.0 * s + f * 2.0 * s, 7.0 * s),
+                            _ => v2(
+                                hip.x + f * 7.0 * s + (t * 2.5 + fi * PI).sin() * 3.0 * s,
+                                ground_y + 15.0 * s,
+                            ),
+                        };
+                        self.feet[i].follow(target, 6.0, 0.8, dt);
+                    }
+                } else if sitk > 0.5 {
                     let ideal = [v2(hip.x + f * 13.0 * s, ground_y), v2(hip.x + f * 16.0 * s, ground_y)];
                     step_pair(&mut self.feet, ideal, Vec2::ZERO, 3.0 * s, 0.2, v2(0.0, -3.0 * s), snap, dt);
                 } else {
@@ -287,11 +333,33 @@ impl Rig {
                     let lead = v2(inp.vel.x * dur * 0.55, 0.0);
                     let lift = v2(0.0, -(3.5 * s + speed * 0.03));
                     step_pair(&mut self.feet, ideal, lead, threshold, dur, lift, snap, dt);
+                    match gesture {
+                        Gesture::TapFoot if !self.feet[1].stepping => {
+                            self.feet[1].pos.y = ground_y - (t * 9.0).sin().abs() * 2.5 * s;
+                        }
+                        Gesture::Kick(e) => {
+                            let leg = d.thigh + d.shin;
+                            let target = if e < 0.0 {
+                                hip + v2(f * 6.0 * s, 13.0 * s)
+                            } else {
+                                hip + v2(f * leg * 0.95 * e + f * 6.0 * s * (1.0 - e), 13.0 * s * (1.0 - e) - 2.0 * s * e)
+                            };
+                            self.feet[1].follow(target, 12.0, 0.7, dt);
+                        }
+                        _ => {}
+                    }
                 }
-                lean_target = (inp.vel.x / s * 0.0008).clamp(-0.32, 0.32) + f * self.crouch.x * 0.3
-                    - f * sitk * 0.05
-                    + (if dance { (t * 3.5).sin() * 0.15 } else { 0.0 })
-                    + (if let Gesture::Punch(e) = gesture { f * e * 0.15 } else { 0.0 });
+                let base_lean = (inp.vel.x / s * 0.0008).clamp(-0.32, 0.32) + f * self.crouch.x * 0.3;
+                lean_target = match gesture {
+                    Gesture::Sleep => -f * 1.45 * sitk,
+                    Gesture::PushUp => f * 1.3 * sitk,
+                    Gesture::Stretch => base_lean - f * 0.12,
+                    Gesture::Kick(e) => base_lean - f * 0.3 * e.max(0.0),
+                    Gesture::Punch(e) => base_lean + f * e * 0.15,
+                    Gesture::Box => base_lean + f * 0.08,
+                    Gesture::Dance => base_lean + (t * 3.5).sin() * 0.15,
+                    _ => base_lean - f * sitk * 0.05,
+                };
             }
             RigState::Air => {
                 for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
@@ -336,7 +404,7 @@ impl Rig {
         let arm = d.arm();
         let mut elbow_bend = -f;
         match inp.state {
-            RigState::Stand { .. } => {
+            RigState::Stand { ground_y, .. } => {
                 let sitk = self.sit.x.clamp(0.0, 1.0);
                 for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
                     let fi = i as f32;
@@ -371,6 +439,45 @@ impl Rig {
                             // Guard hand up.
                             target = chest + v2(f * 6.0 * s, 1.0 * s);
                             freq = 8.0;
+                        }
+                        Gesture::Kick(_) => {
+                            // Arms out for balance.
+                            target = chest + v2(side * 10.0 * s, -4.0 * s);
+                            freq = 8.0;
+                        }
+                        Gesture::Stretch => {
+                            target = chest + v2(side * 4.0 * s + f * 2.0 * s + (t * 2.0 + fi).sin() * s, -arm * 0.92);
+                            freq = 3.0;
+                        }
+                        Gesture::Scratch if i == 1 => {
+                            target = head + v2(f * 2.0 * s + (t * 22.0).sin() * 1.5 * s, -d.head_r * 0.6);
+                            freq = 9.0;
+                        }
+                        Gesture::TapFoot => {
+                            // Arms crossed.
+                            target = chest + v2(f * (4.0 + fi * 2.0) * s, 7.0 * s);
+                            freq = 7.0;
+                        }
+                        Gesture::Box => {
+                            let e = (t * 9.0 + fi * PI).sin().max(0.0);
+                            target = chest + v2(f * (4.0 * s + arm * 0.75 * e), -3.0 * s);
+                            freq = 14.0;
+                        }
+                        Gesture::Meditate => {
+                            target = chest + v2(side * 12.0 * s + f * s, 9.0 * s);
+                            freq = 3.0;
+                        }
+                        Gesture::PushUp => {
+                            target = v2(chest.x + f * fi * 2.0 * s, ground_y);
+                            freq = 10.0;
+                        }
+                        Gesture::Sleep => {
+                            target = chest + v2(f * (3.0 + fi * 2.0) * s, 2.0 * s);
+                            freq = 3.0;
+                        }
+                        Gesture::EdgeSit => {
+                            target = v2(hip.x - f * (3.0 + fi * 3.0) * s, ground_y);
+                            freq = 6.0;
                         }
                         _ => {}
                     }

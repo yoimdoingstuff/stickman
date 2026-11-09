@@ -72,21 +72,30 @@ pub enum Mode {
 
 #[derive(Clone, Copy, Debug)]
 enum Action {
-    Idle(f32),
+    /// Standing around. `fidget` plays on top; with no fidget it looks around.
+    Idle { t: f32, fidget: Gesture, look: f32 },
     Walk { x: f32, speed: f32 },
     Sit(f32),
-    Wave(f32),
-    Dance(f32),
+    /// Hold a gesture for a while (wave, dance, sleep, push-ups, ...).
+    Pose { t: f32, gesture: Gesture },
     JumpPrep { t: f32, kind: JumpKind },
     ClimbApproach { win: WinId, side: Side },
     Recover(f32),
     Punch { t: f32, target: u32, dir: f32, fired: bool },
+    Kick { t: f32, target: Option<u32>, dir: f32, fired: bool },
+    /// Walk to a ledge, then sit on it facing the drop.
+    EdgeSit { t: f32, edge: f32, dir: f32 },
+}
+
+fn idle(t: f32) -> Action {
+    Action::Idle { t, fidget: Gesture::None, look: 1.0 }
 }
 
 #[derive(Clone, Copy, Debug)]
 enum JumpKind {
     To { target: Vec2, support: Support },
     Flip,
+    Cartwheel,
     Cursor { secs: f32 },
 }
 
@@ -94,8 +103,8 @@ enum JumpKind {
 #[derive(Default)]
 pub struct Events {
     pub landed: Option<f32>,
-    /// (peer id, direction) when a punch connects.
-    pub punch: Option<(u32, f32)>,
+    /// (peer id, impulse, max distance) when a punch or kick lands.
+    pub hit: Option<(u32, Vec2, f32)>,
 }
 
 pub struct Stickman {
@@ -127,6 +136,7 @@ pub struct Stickman {
     hang: f32,
     cursor: Vec2,
     cursor_vel: Vec2,
+    sleeping: bool,
     pub rig: Rig,
 }
 
@@ -165,6 +175,7 @@ impl Stickman {
             hang: 0.0,
             cursor: Vec2::ZERO,
             cursor_vel: Vec2::ZERO,
+            sleeping: false,
             rig: Rig::new(),
         }
     }
@@ -207,8 +218,19 @@ impl Stickman {
 
     pub fn is_resting(&self) -> bool {
         matches!(self.mode, Mode::Ground(_))
-            && matches!(self.action, Some(Action::Sit(_)) | Some(Action::Idle(_)) | None)
+            && matches!(
+                self.action,
+                Some(Action::Sit(_))
+                    | Some(Action::Idle { fidget: Gesture::None, .. })
+                    | Some(Action::Pose { gesture: Gesture::Sleep, .. })
+                    | None
+            )
             && self.vel.x.abs() < 1.0
+    }
+
+    /// Head position and time, while asleep (for drawing Z's).
+    pub fn zzz(&self) -> Option<(Vec2, f32)> {
+        (self.sleeping && self.ragdoll.is_none()).then(|| (self.rig.pose.head, self.time))
     }
 
     pub fn is_ragdoll(&self) -> bool {
@@ -330,11 +352,16 @@ impl Stickman {
             return;
         }
         self.action = Some(match intent {
-            Intent::Idle { secs } => Action::Idle(secs),
+            Intent::Idle { secs, fidget } => Action::Idle { t: secs, fidget, look: 0.8 },
             Intent::Walk { x, speed } => Action::Walk { x, speed },
             Intent::Sit { secs } => Action::Sit(secs),
-            Intent::Wave { secs } => Action::Wave(secs),
-            Intent::Dance { secs } => Action::Dance(secs),
+            Intent::Pose { secs, gesture } => Action::Pose { t: secs, gesture },
+            Intent::Kick { target, dir } => {
+                self.facing = dir;
+                Action::Kick { t: 0.0, target, dir, fired: false }
+            }
+            Intent::EdgeSit { secs, edge, dir } => Action::EdgeSit { t: secs, edge, dir },
+            Intent::Cartwheel => Action::JumpPrep { t: 0.15, kind: JumpKind::Cartwheel },
             Intent::Jump { target, support } => {
                 if (target.x - self.pos.x).abs() > 1.0 {
                     self.facing = (target.x - self.pos.x).signum();
@@ -360,7 +387,7 @@ impl Stickman {
                         _ => Layer::Front,
                     };
                 }
-                Action::Idle(0.6)
+                idle(0.6)
             }
         });
     }
@@ -371,6 +398,7 @@ impl Stickman {
     pub fn update(&mut self, dt: f32, world: &World, cursor: Vec2, cursor_vel: Vec2) -> Events {
         self.time += dt;
         self.crouch = 0.0;
+        self.sleeping = false;
         self.cursor = cursor;
         self.cursor_vel = cursor_vel;
         let mut ev = Events::default();
@@ -569,18 +597,62 @@ impl Stickman {
         let mut gesture = Gesture::None;
         if let Some(action) = self.action {
             let next = match action {
-                Action::Idle(t) => (t > dt).then(|| Action::Idle(t - dt)),
+                Action::Idle { t, fidget, look } => {
+                    gesture = fidget;
+                    let mut look = look - dt;
+                    if look <= 0.0 && fidget == Gesture::None {
+                        // Glance around; prefer looking at the cursor if it's close.
+                        look = 1.1 + (self.time * 7.3).sin().abs() * 1.4;
+                        let to = self.cursor - self.pos;
+                        self.facing = if to.len() < 300.0 * s && to.x.abs() > 4.0 * s {
+                            to.x.signum()
+                        } else {
+                            -self.facing
+                        };
+                    }
+                    (t > dt).then_some(Action::Idle { t: t - dt, fidget, look })
+                }
                 Action::Sit(t) => {
                     sit = true;
                     (t > dt).then(|| Action::Sit(t - dt))
                 }
-                Action::Wave(t) => {
-                    gesture = Gesture::Wave;
-                    (t > dt).then(|| Action::Wave(t - dt))
+                Action::Pose { t, gesture: g } => {
+                    gesture = g;
+                    self.sleeping = g == Gesture::Sleep;
+                    (t > dt).then_some(Action::Pose { t: t - dt, gesture: g })
                 }
-                Action::Dance(t) => {
-                    gesture = Gesture::Dance;
-                    (t > dt).then(|| Action::Dance(t - dt))
+                Action::Kick { t, target, dir, fired } => {
+                    let t = t + dt;
+                    let ext = if t < 0.12 {
+                        -(t / 0.12)
+                    } else if t < 0.26 {
+                        1.0
+                    } else {
+                        (1.0 - (t - 0.26) / 0.18).max(0.0)
+                    };
+                    gesture = Gesture::Kick(ext);
+                    self.facing = dir;
+                    let mut fired = fired;
+                    if t >= 0.12 && !fired {
+                        fired = true;
+                        if let Some(id) = target {
+                            ev.hit = Some((id, v2(dir * 950.0, -520.0) * s, 50.0 * s));
+                        }
+                    }
+                    (t < 0.5).then_some(Action::Kick { t, target, dir, fired })
+                }
+                Action::EdgeSit { t, edge, dir } => {
+                    let spot = edge - dir * 4.0 * s;
+                    let dx = spot - self.pos.x;
+                    if dx.abs() > 2.5 * s {
+                        desired = dx.signum() * 90.0 * s;
+                        Some(action)
+                    } else {
+                        self.pos.x = spot;
+                        self.facing = dir;
+                        gesture = Gesture::EdgeSit;
+                        (t > dt).then_some(Action::EdgeSit { t: t - dt, edge, dir })
+                    }
                 }
                 Action::Recover(t) => {
                     self.crouch = (t / 0.5).min(1.0) * 0.8;
@@ -609,7 +681,7 @@ impl Stickman {
                     let mut fired = fired;
                     if t >= 0.14 && !fired {
                         fired = true;
-                        ev.punch = Some((target, dir));
+                        ev.hit = Some((target, v2(dir * 650.0, -380.0) * s, 40.0 * s));
                     }
                     if (0.14..0.24).contains(&t) {
                         desired = dir * 60.0 * s;
@@ -651,7 +723,7 @@ impl Stickman {
         let accel = if desired.abs() > self.vel.x.abs() { 1300.0 } else { 2200.0 } * s;
         self.vel.x = approach(self.vel.x, desired, accel * dt);
         self.pos.x += self.vel.x * dt;
-        if desired.abs() > 1.0 && !matches!(self.action, Some(Action::Punch { .. })) {
+        if desired.abs() > 1.0 && !matches!(self.action, Some(Action::Punch { .. }) | Some(Action::Kick { .. })) {
             self.facing = desired.signum();
         }
         self.pos.y = surf.y - d.stance;
@@ -694,6 +766,13 @@ impl Stickman {
                 let flight = self.launch(target, 75.0 * s);
                 self.spin_rate = -self.facing * TAU / flight;
                 // Land back where we took off, even inside a window.
+                self.jump_target = from;
+            }
+            JumpKind::Cartwheel => {
+                let mut target = foot + v2(self.facing * 80.0 * s, 0.0);
+                target.x = target.x.clamp(world.work.l + 10.0 * s, world.work.r - 10.0 * s);
+                let flight = self.launch(target, 30.0 * s);
+                self.spin_rate = self.facing * TAU / flight;
                 self.jump_target = from;
             }
             JumpKind::Cursor { secs } => {
@@ -858,7 +937,7 @@ impl Stickman {
         self.vel.x *= 0.35;
         self.rig.on_land(impact);
         self.anchor = surf.support.window().and_then(|id| window_origin(world, id).map(|o| (id, o)));
-        self.action = Some(if impact > 1300.0 * s { Action::Recover(0.5) } else { Action::Idle(0.15) });
+        self.action = Some(if impact > 1300.0 * s { Action::Recover(0.5) } else { idle(0.15) });
     }
 
     fn update_climb(&mut self, dt: f32, world: &World, win: WinId, side: Side) -> RigState {
@@ -900,7 +979,7 @@ impl Stickman {
             self.mode = Mode::Ground(Support::Window(win));
             self.anchor = Some((win, origin));
             self.layer = Layer::On(win);
-            self.action = Some(Action::Idle(0.4));
+            self.action = Some(idle(0.4));
         } else {
             self.mode = Mode::Mantle { win, side, t, from };
         }

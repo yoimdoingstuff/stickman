@@ -190,10 +190,10 @@ fn main() {
             if let Some(impact) = ev.landed {
                 brain.notify(BrainEvent::Landed(impact));
             }
-            if let Some((target, dir)) = ev.punch {
+            if let Some((target, impulse, range)) = ev.hit {
                 if let Some(peer) = peers.get(target) {
-                    if (peer.hip - man.pos).len() < 40.0 * s {
-                        peers.send_hit(target, v2(dir * 650.0, -380.0) * s);
+                    if (peer.hip - man.pos).len() < range {
+                        peers.send_hit(target, impulse);
                     }
                 }
             }
@@ -201,7 +201,7 @@ fn main() {
 
         let center = man.center();
         let origin = v2((center.x - size as f32 * 0.5).floor(), (center.y - size as f32 * 0.55).floor());
-        render::draw(&mut pixmap, &man.pose(), origin, &d, &style);
+        render::draw(&mut pixmap, &man.pose(), origin, &d, &style, man.zzz());
         let occluders = world.occluders(man.layer);
         plat.present(pixmap.data(), size, size, origin.x as i32, origin.y as i32, &occluders);
 

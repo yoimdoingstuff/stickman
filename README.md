@@ -28,9 +28,15 @@ To build locally instead: install Rust (https://rustup.rs) and run
   other over when thrown into one another. They talk over UDP on
   `127.0.0.1` only, so nothing leaves your PC.
 
-On its own it walks, runs, sits, dances, waves, backflips, jumps between
-windows, climbs window sides, walks behind windows, hops into windows, and
-jumps up to hang off your mouse cursor (shake the mouse to fling it off).
+On its own it walks, runs, sits, dances, waves, backflips, cartwheels, jumps
+between windows, climbs window sides, walks behind windows, hops into
+windows, sits on window ledges with its legs dangling, and jumps up to hang
+off your mouse cursor (shake the mouse to fling it off).
+
+When it's standing around it fidgets: looks around (and at your cursor),
+stretches, scratches its head, or crosses its arms and taps its foot when
+bored. When tired it naps (with floating Z's) or meditates; with energy to
+spare it does push-ups, shadowboxes or practises kicks.
 
 Settings are saved to `%APPDATA%\stickman\settings.txt`:
 
