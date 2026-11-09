@@ -1,7 +1,6 @@
 # stickman
 
-A procedurally animated stickman that lives on your desktop, inspired by
-*Animator vs. Animation*. It walks on the taskbar, jumps onto windows, climbs
+A procedurally animated stickman that lives on your desktop. It walks on the taskbar, jumps onto windows, climbs
 their sides, walks behind them, and can be picked up and thrown. Everything
 runs offline.
 
