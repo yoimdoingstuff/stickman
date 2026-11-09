@@ -33,6 +33,34 @@ between windows, climbs window sides, walks behind windows, hops into
 windows, sits on window ledges with its legs dangling, and jumps up to hang
 off your mouse cursor (shake the mouse to fling it off).
 
+**Getting around.** Windows are solid while it's in the air: it bonks its
+head on window bottoms and bounces off their sides, and it only jumps when
+the arc is clear. Otherwise it goes around: climbs a window's outer wall,
+drops off edges, or dives into the taskbar and pops out on top of (or
+inside) another window. Inside a window it climbs the inner wall to get
+back out over the top. The taskbar is found with the standard appbar API,
+so this works with the stock Windows 11 taskbar and ExplorerPatcher's, on
+any edge (top-docked taskbars just skip the diving; auto-hide is detected).
+
+**Walk styles.** Normal, sneaking (tiptoe, hands up), strutting, marching,
+skipping, and a tired shuffle, picked from its mood.
+
+**Health (hidden).** Hard landings, slams, hits from other stickmen and
+being squashed all hurt. Below half health it limps; badly hurt it can only
+crawl on hands and knees and won't do anything acrobatic. It heals slowly
+over time, faster while asleep.
+
+**Squashing.** Drag a window into it and it gets shoved along, or flattened
+like a pancake against the screen edge (or the floor, if a window comes
+down on it), then pops out limp.
+
+**Fights.** Once two stickmen start fighting they keep at it for several
+seconds: closing in, mixing punches and kicks, backing off, guarding, and
+waiting for the other to get up.
+
+**Gravity** can be changed from the right-click menu (Moon to Jupiter).
+Lower gravity also means higher, floatier jumps.
+
 When it's standing around it fidgets: looks around (and at your cursor),
 stretches, scratches its head, or crosses its arms and taps its foot when
 bored. When tired it naps (with floating Z's) or meditates; with energy to
@@ -45,6 +73,7 @@ color=#000000
 outline=true
 stay_in_front=false
 grab_cursor=true
+gravity=1
 ```
 
 Any colour works. Dark colours get a light outline and light colours a dark
@@ -71,7 +100,12 @@ out, so it looks like it's behind them.
 ## Roadmap
 
 1. ~~Procedural stickman, walking, jumping, climbing, behind-window occlusion~~
-2. Settings/permissions panel + config file
-3. Multi-monitor support
-4. Train a small behavior model in Python, export weights, run inference in Rust
-5. macOS / Linux backends
+2. Stand on things *inside* windows (message boxes, images, album covers)
+   using Windows UI Automation to find their rectangles
+3. Dive into the actual taskbar button of the target window (also via UI
+   Automation) instead of wherever it's standing
+4. Pick up and carry desktop icons (behind a permission toggle)
+5. Settings/permissions panel
+6. Multi-monitor support
+7. Train a small behavior model in Python, export weights, run inference in Rust
+8. macOS / Linux backends

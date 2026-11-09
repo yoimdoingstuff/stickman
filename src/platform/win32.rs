@@ -23,13 +23,17 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Shell::{
+    SHAppBarMessage, ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     EnumWindows, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PeekMessageW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, GWL_EXSTYLE,
-    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE,
+    HMENU, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    PM_REMOVE,
     SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -38,7 +42,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::{Event, MenuItem, Platform};
 use crate::math::{v2, Rect, Vec2};
-use crate::world::{WinId, WinInfo};
+use crate::world::{Edge, Taskbar, WinId, WinInfo};
 
 thread_local! {
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
@@ -260,6 +264,34 @@ impl Platform for Win32Platform {
         }
     }
 
+    fn taskbar(&self) -> Option<Taskbar> {
+        unsafe {
+            let mut abd: APPBARDATA = zeroed();
+            abd.cbSize = size_of::<APPBARDATA>() as u32;
+            if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) == 0 {
+                return None;
+            }
+            let rc = abd.rc;
+            let rect = Rect { l: rc.left as f32, t: rc.top as f32, r: rc.right as f32, b: rc.bottom as f32 };
+            let edge = match abd.uEdge {
+                e if e == ABE_LEFT => Edge::Left,
+                e if e == ABE_TOP => Edge::Top,
+                e if e == ABE_RIGHT => Edge::Right,
+                e if e == ABE_BOTTOM => Edge::Bottom,
+                _ => return None,
+            };
+            // Auto-hide: the work area then covers the taskbar's spot.
+            let work = self.work_area();
+            let hidden = match edge {
+                Edge::Bottom => work.b > rect.t + 2.0,
+                Edge::Top => work.t < rect.b - 2.0,
+                Edge::Left => work.l < rect.r - 2.0,
+                Edge::Right => work.r > rect.l + 2.0,
+            };
+            (!hidden).then_some(Taskbar { rect, edge })
+        }
+    }
+
     fn windows(&mut self) -> Vec<WinInfo> {
         let mut handles: Vec<HWND> = Vec::new();
         unsafe {
@@ -349,17 +381,24 @@ impl Platform for Win32Platform {
     }
 
     fn show_menu(&mut self, items: &[MenuItem]) -> Option<u32> {
-        unsafe {
-            let menu = CreatePopupMenu();
+        unsafe fn build(menu: HMENU, items: &[MenuItem]) {
             for item in items {
-                if item.id == 0 {
+                let label = wide(&item.label);
+                if !item.children.is_empty() {
+                    let sub = CreatePopupMenu();
+                    build(sub, &item.children);
+                    AppendMenuW(menu, MF_POPUP, sub as usize, label.as_ptr());
+                } else if item.id == 0 {
                     AppendMenuW(menu, MF_SEPARATOR, 0, null());
                 } else {
-                    let label = wide(&item.label);
                     let flags = MF_STRING | if item.checked { MF_CHECKED } else { 0 };
                     AppendMenuW(menu, flags, item.id as usize, label.as_ptr());
                 }
             }
+        }
+        unsafe {
+            let menu = CreatePopupMenu();
+            build(menu, items);
             let mut pt: POINT = zeroed();
             GetCursorPos(&mut pt);
             SetForegroundWindow(self.hwnd);

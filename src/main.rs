@@ -38,6 +38,15 @@ const MENU_COLOR: u32 = 4;
 const MENU_LIMP: u32 = 5;
 const MENU_OUTLINE: u32 = 6;
 const MENU_CURSOR: u32 = 7;
+/// Gravity presets: menu ids MENU_GRAVITY + index.
+const MENU_GRAVITY: u32 = 20;
+const GRAVITY_PRESETS: [(&str, f32); 5] = [
+    ("Moon (0.3x)", 0.3),
+    ("Low (0.6x)", 0.6),
+    ("Normal", 1.0),
+    ("Heavy (1.6x)", 1.6),
+    ("Jupiter (2.5x)", 2.5),
+];
 const MENU_QUIT: u32 = 99;
 
 fn main() {
@@ -51,7 +60,7 @@ fn main() {
     let d = Dims::new(plat.dpi_scale() * SIZE);
     let s = d.s;
     let mut rng = rng::Rng::seeded();
-    let mut world = World { work: plat.work_area(), windows: plat.windows() };
+    let mut world = World { work: plat.work_area(), windows: plat.windows(), taskbar: plat.taskbar() };
     let mut peers = Peers::new();
 
     let spawn = v2(world.work.l + world.work.width() * rng.range(0.2, 0.8), world.work.t + 80.0 * s);
@@ -60,6 +69,7 @@ fn main() {
     let mut man = Stickman::new(d, spawn);
     man.force_front = settings.stay_in_front;
     man.allow_cursor = settings.grab_cursor;
+    man.gravity = settings.gravity;
     let mut brain = UtilityBrain::new(Personality::random(&mut rng));
 
     let size = ((190.0 * s).ceil() as u32).max(64);
@@ -89,6 +99,13 @@ fn main() {
                     }
                 }
                 Event::RightClick => {
+                    let gravity_items = GRAVITY_PRESETS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (label, g))| {
+                            MenuItem::new(MENU_GRAVITY + i as u32, label, (settings.gravity - g).abs() < 0.01)
+                        })
+                        .collect();
                     let items = [
                         MenuItem::new(MENU_LIMP, "Ragdoll", false),
                         MenuItem::new(MENU_COME, "Come here", false),
@@ -96,6 +113,7 @@ fn main() {
                         MenuItem::new(MENU_FRONT, "Stay in front of windows", man.force_front),
                         MenuItem::new(MENU_CURSOR, "Can grab my cursor", man.allow_cursor),
                         MenuItem::new(MENU_PAUSE, "Pause thinking", paused),
+                        MenuItem::submenu("Gravity", gravity_items),
                         MenuItem::separator(),
                         MenuItem::new(MENU_COLOR, "Change colour...", false),
                         MenuItem::new(MENU_OUTLINE, "Show outline", settings.outline),
@@ -132,6 +150,11 @@ fn main() {
                             settings.save();
                         }
                         Some(MENU_QUIT) => break 'run,
+                        Some(id) if (MENU_GRAVITY..MENU_GRAVITY + GRAVITY_PRESETS.len() as u32).contains(&id) => {
+                            settings.gravity = GRAVITY_PRESETS[(id - MENU_GRAVITY) as usize].1;
+                            man.gravity = settings.gravity;
+                            settings.save();
+                        }
                         _ => {}
                     }
                     // The menu blocks; don't simulate the time it was open.
@@ -148,9 +171,23 @@ fn main() {
         if scan <= 0.0 {
             world.windows = plat.windows();
             world.work = plat.work_area();
+            world.taskbar = plat.taskbar();
             scan = WINDOW_SCAN;
-        } else if let Some(id) = man.attached_window() {
-            world.set_window_rect(id, plat.window_rect(id));
+        } else {
+            if let Some(id) = man.attached_window() {
+                world.set_window_rect(id, plat.window_rect(id));
+            }
+            // Track the foreground window every frame: it's the one being
+            // dragged around, and it can shove or squash the stickman.
+            if let Some(id) = world.windows.first().map(|w| w.id) {
+                let new = plat.window_rect(id);
+                let old = world.set_window_rect(id, new);
+                if let (Some(old), Some(new)) = (old, new) {
+                    if old != new {
+                        man.shove(&world, id, old, new, dt);
+                    }
+                }
+            }
         }
 
         let cursor = plat.cursor();
@@ -182,7 +219,7 @@ fn main() {
                     peers.list.iter().map(|p| PeerView { id: p.id, hip: p.hip, ragdoll: p.ragdoll }).collect();
                 if let Some(p) = man.perceive(cursor, views) {
                     let intent = brain.decide(&p, &world, &mut rng);
-                    man.apply(intent);
+                    man.apply(intent, &world);
                 }
             }
             brain.tick(STEP);
@@ -201,8 +238,18 @@ fn main() {
 
         let center = man.center();
         let origin = v2((center.x - size as f32 * 0.5).floor(), (center.y - size as f32 * 0.55).floor());
-        render::draw(&mut pixmap, &man.pose(), origin, &d, &style, man.zzz());
-        let occluders = world.occluders(man.layer);
+        if man.hidden() {
+            pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        } else {
+            render::draw(&mut pixmap, &man.pose(), origin, &d, &style, man.zzz());
+        }
+        let mut occluders = world.occluders(man.layer);
+        // Diving into the taskbar: it covers us as we go in.
+        if man.in_portal() {
+            if let Some(tb) = world.taskbar {
+                occluders.push(tb.rect);
+            }
+        }
         plat.present(pixmap.data(), size, size, origin.x as i32, origin.y as i32, &occluders);
 
         topmost -= dt;

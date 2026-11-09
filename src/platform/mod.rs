@@ -2,7 +2,7 @@
 //! so macOS / Linux backends can be added later without touching the rest.
 
 use crate::math::{Rect, Vec2};
-use crate::world::{WinId, WinInfo};
+use crate::world::{Taskbar, WinId, WinInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -13,18 +13,23 @@ pub enum Event {
 }
 
 pub struct MenuItem {
-    /// 0 means separator.
+    /// 0 with no children means separator.
     pub id: u32,
     pub label: String,
     pub checked: bool,
+    /// Non-empty makes this a submenu.
+    pub children: Vec<MenuItem>,
 }
 
 impl MenuItem {
     pub fn new(id: u32, label: &str, checked: bool) -> Self {
-        MenuItem { id, label: label.to_string(), checked }
+        MenuItem { id, label: label.to_string(), checked, children: Vec::new() }
     }
     pub fn separator() -> Self {
-        MenuItem { id: 0, label: String::new(), checked: false }
+        MenuItem { id: 0, label: String::new(), checked: false, children: Vec::new() }
+    }
+    pub fn submenu(label: &str, children: Vec<MenuItem>) -> Self {
+        MenuItem { id: 0, label: label.to_string(), checked: false, children }
     }
 }
 
@@ -32,6 +37,9 @@ pub trait Platform {
     fn poll_events(&mut self) -> Vec<Event>;
     /// Screen area not covered by the taskbar, in physical pixels.
     fn work_area(&self) -> Rect;
+    /// The taskbar, if it's showing (not auto-hidden). Works with the stock
+    /// Windows 11 taskbar and ExplorerPatcher's, on any screen edge.
+    fn taskbar(&self) -> Option<Taskbar>;
     /// Visible top-level windows, top-most first.
     fn windows(&mut self) -> Vec<WinInfo>;
     /// Fresh rectangle of one window, or None if it is gone/minimized.

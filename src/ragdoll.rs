@@ -4,7 +4,7 @@
 
 use crate::math::*;
 use crate::rig::Pose;
-use crate::stickman::{Dims, GRAVITY};
+use crate::stickman::Dims;
 use crate::world::*;
 
 const HEAD: usize = 0;
@@ -131,8 +131,17 @@ impl Ragdoll {
         self.p.iter().fold(f32::MIN, |m, q| m.max(q.y))
     }
 
-    pub fn step(&mut self, dt: f32, d: &Dims, world: &World, layer: Layer) {
-        let g = v2(0.0, GRAVITY * d.s) * (dt * dt);
+    /// Move the whole body by `delta` this step (gains that as velocity).
+    pub fn shove(&mut self, delta: Vec2) {
+        for q in self.p.iter_mut() {
+            *q += delta;
+        }
+        self.still = 0.0;
+    }
+
+    /// `gravity` in px/s².
+    pub fn step(&mut self, dt: f32, d: &Dims, world: &World, layer: Layer, gravity: f32) {
+        let g = v2(0.0, gravity) * (dt * dt);
         let start = self.p;
         for i in 0..N {
             let v = (self.p[i] - self.prev[i]) * 0.996;

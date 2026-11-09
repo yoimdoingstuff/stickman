@@ -1,9 +1,29 @@
 //! What the stickman knows about the desktop: the work area and the
 //! open windows (in z-order), plus the surfaces and walls they create.
 
-use crate::math::{Rect, Vec2};
+use crate::math::{v2, Rect, Vec2};
 
 pub type WinId = u64;
+
+/// Which screen edge the taskbar is docked to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Top,
+    Right,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Taskbar {
+    pub rect: Rect,
+    pub edge: Edge,
+}
+
+/// The space the body takes up, given where its feet are.
+pub fn body_box(foot: Vec2, s: f32) -> Rect {
+    Rect { l: foot.x - 5.0 * s, r: foot.x + 5.0 * s, t: foot.y - 62.0 * s, b: foot.y }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WinInfo {
@@ -85,9 +105,51 @@ pub struct World {
     pub work: Rect,
     /// Windows ordered top-most first.
     pub windows: Vec<WinInfo>,
+    /// Visible (not auto-hidden) taskbar, if any.
+    pub taskbar: Option<Taskbar>,
 }
 
 impl World {
+    /// Windows that are solid to a flying body on `layer`: the ones it's
+    /// drawn in front of. Windows in front of it just cover it (it passes
+    /// behind them), and on the desktop layer nothing is solid.
+    pub fn solids(&self, layer: Layer) -> Vec<(WinId, Rect)> {
+        let from = match layer {
+            Layer::Behind => return Vec::new(),
+            Layer::Front => 0,
+            Layer::On(id) => self.windows.iter().position(|w| w.id == id).unwrap_or(0),
+        };
+        self.windows[from..].iter().map(|w| (w.id, w.rect)).collect()
+    }
+
+    /// Windows the body is already overlapping (ignored for collisions, or
+    /// it would get stuck the moment it jumps).
+    pub fn overlapping(&self, foot: Vec2, s: f32) -> Vec<WinId> {
+        let b = body_box(foot, s);
+        self.windows.iter().filter(|w| w.rect.overlaps(&b)).map(|w| w.id).collect()
+    }
+
+    /// Would a body flying this arc clip a solid window on the way?
+    #[allow(clippy::too_many_arguments)]
+    pub fn arc_clear(&self, layer: Layer, foot: Vec2, vel: Vec2, g: f32, flight: f32, s: f32, skip: &[WinId]) -> bool {
+        let solids: Vec<Rect> =
+            self.solids(layer).into_iter().filter(|(id, _)| !skip.contains(id)).map(|(_, r)| r).collect();
+        if solids.is_empty() {
+            return true;
+        }
+        let n = 24;
+        (1..n).all(|i| {
+            let t = flight * i as f32 / n as f32;
+            let p = foot + vel * t + v2(0.0, 0.5 * g * t * t);
+            let b = body_box(p, s);
+            !solids.iter().any(|r| r.overlaps(&b))
+        })
+    }
+
+    /// Can the stickman dive into the taskbar from the floor?
+    pub fn portal_edge(&self) -> Option<Edge> {
+        self.taskbar.map(|t| t.edge).filter(|e| *e != Edge::Top)
+    }
     pub fn window(&self, id: WinId) -> Option<&WinInfo> {
         self.windows.iter().find(|w| w.id == id)
     }
@@ -180,7 +242,9 @@ impl World {
     }
 
     /// Update (or remove, if it vanished) one window between full refreshes.
-    pub fn set_window_rect(&mut self, id: WinId, rect: Option<Rect>) {
+    /// Returns its previous rectangle.
+    pub fn set_window_rect(&mut self, id: WinId, rect: Option<Rect>) -> Option<Rect> {
+        let old = self.window(id).map(|w| w.rect);
         match rect {
             Some(r) => {
                 if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -189,5 +253,6 @@ impl World {
             }
             None => self.windows.retain(|w| w.id != id),
         }
+        old
     }
 }

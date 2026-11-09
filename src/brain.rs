@@ -3,7 +3,7 @@
 //! from a weights file) without touching the body or animation code.
 
 use crate::math::*;
-use crate::rig::Gesture;
+use crate::rig::{Gesture, WalkStyle};
 use crate::rng::Rng;
 use crate::world::*;
 
@@ -11,7 +11,7 @@ use crate::world::*;
 pub enum Intent {
     /// Stand around, optionally fidgeting.
     Idle { secs: f32, fidget: Gesture },
-    Walk { x: f32, speed: f32 },
+    Walk { x: f32, speed: f32, style: WalkStyle },
     Sit { secs: f32 },
     /// Hold a gesture: wave, dance, sleep, push-ups, meditate, shadowbox...
     Pose { secs: f32, gesture: Gesture },
@@ -22,7 +22,10 @@ pub enum Intent {
     /// Jump so the feet land at `target` on `support`.
     Jump { target: Vec2, support: Support },
     Flip,
-    Climb { win: WinId, side: Side },
+    /// Climb a window's side; `inner` = from inside the window.
+    Climb { win: WinId, side: Side, inner: bool },
+    /// Dive into the taskbar and pop out at another window.
+    Portal { target: Support },
     /// Switch between walking in front of and behind windows.
     ToggleLayer,
     /// Jump up, grab the mouse cursor and hang off it for a while.
@@ -48,6 +51,11 @@ pub struct Perception {
     /// Feet-to-hands height when reaching up.
     pub reach: f32,
     pub cursor: Vec2,
+    /// 0..1, hidden health.
+    pub health: f32,
+    pub layer: Layer,
+    /// Current gravity, px/s².
+    pub gravity: f32,
     pub allow_cursor: bool,
     pub peers: Vec<PeerView>,
 }
@@ -130,6 +138,8 @@ pub struct UtilityBrain {
     history: Vec<Kind>,
     /// Who hit us last, and how annoyed we still are (0..1).
     grudge: Option<(u32, f32)>,
+    /// An ongoing fight: (opponent, seconds left).
+    fight: Option<(u32, f32)>,
 }
 
 impl UtilityBrain {
@@ -140,7 +150,69 @@ impl UtilityBrain {
             current: Kind::Idle,
             history: Vec::new(),
             grudge: None,
+            fight: None,
         }
+    }
+
+    fn start_fight(&mut self, id: u32, rng_secs: f32) {
+        match &mut self.fight {
+            Some((who, t)) if *who == id => *t = t.max(rng_secs),
+            _ => self.fight = Some((id, rng_secs)),
+        }
+    }
+
+    /// Mid-fight: keep at it until the timer runs out, someone's too hurt,
+    /// or the opponent's gone. Returns None to fall back to normal choices.
+    fn fight_move(&mut self, p: &Perception, surf: &Surface, rng: &mut Rng) -> Option<Intent> {
+        let (target, _) = self.fight?;
+        let s = p.scale;
+        let Some(foe) = p.peers.iter().find(|q| q.id == target).copied() else {
+            self.fight = None;
+            return None;
+        };
+        if p.health < 0.3 || (foe.hip.y - p.hip.y).abs() > 40.0 * s {
+            self.fight = None;
+            return None;
+        }
+        let dx = foe.hip.x - p.hip.x;
+        let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+        let pers = self.personality;
+        let walk = |x: f32, speed: f32| Intent::Walk {
+            x: x.clamp(surf.x0 + 6.0 * s, surf.x1 - 6.0 * s),
+            speed: speed * s,
+            style: WalkStyle::Normal,
+        };
+
+        let mut options: Vec<(Kind, Intent, f32)> = Vec::new();
+        if foe.ragdoll {
+            // They're down: taunt, square up, or close in for when they get up.
+            options.push((Kind::Box, Intent::Pose { secs: 0.7, gesture: Gesture::Box }, 0.5 + pers.mischief * 0.3));
+            options.push((Kind::Idle, Intent::Idle { secs: 0.5, fidget: Gesture::None }, 0.4));
+            if dx.abs() > 40.0 * s {
+                options.push((Kind::Approach, walk(foe.hip.x - dir * 30.0 * s, 140.0), 0.6));
+            }
+        } else if dx.abs() > 30.0 * s {
+            options.push((Kind::Approach, walk(foe.hip.x - dir * 18.0 * s, 280.0), 1.0));
+        } else {
+            if dx.abs() < 26.0 * s {
+                options.push((Kind::Punch, Intent::Punch { target, dir }, 0.7 + pers.mischief * 0.3));
+            }
+            options.push((Kind::Kick, Intent::Kick { target: Some(target), dir }, 0.55 + pers.mischief * 0.2));
+            // Back off a step, or put the guard up, to make room for a counter.
+            options.push((Kind::Walk, walk(p.hip.x - dir * 28.0 * s, 160.0), 0.3 + pers.laziness * 0.2));
+            options.push((Kind::Box, Intent::Pose { secs: 0.5, gesture: Gesture::Box }, 0.25));
+        }
+        let mut best = (Kind::Idle, Intent::Idle { secs: 0.3, fidget: Gesture::None }, f32::MIN);
+        for (kind, intent, score) in options {
+            // Mild variety pressure so it mixes punches, kicks and footwork.
+            let repeats = self.history.iter().rev().take(2).filter(|h| **h == kind).count() as i32;
+            let score = score * 0.75f32.powi(repeats) + rng.f32() * 0.35;
+            if score > best.2 {
+                best = (kind, intent, score);
+            }
+        }
+        self.commit(best.0);
+        Some(best.1)
     }
 
     fn grudge_against(&self, id: u32) -> f32 {
@@ -208,6 +280,12 @@ impl Brain for UtilityBrain {
         if matches!(self.grudge, Some((_, g)) if g <= 0.0) {
             self.grudge = None;
         }
+        if let Some((_, t)) = &mut self.fight {
+            *t -= dt;
+        }
+        if matches!(self.fight, Some((_, t)) if t <= 0.0) {
+            self.fight = None;
+        }
     }
 
     fn notify(&mut self, e: BrainEvent) {
@@ -227,6 +305,8 @@ impl Brain for UtilityBrain {
                 let g = (self.grudge_against(from) + 0.5 + self.personality.mischief * 0.3).min(1.0);
                 self.grudge = Some((from, g));
                 self.current = Kind::Idle;
+                // Hit back: fight for a while (longer if it's a grudge match).
+                self.start_fight(from, 6.0 + g * 6.0);
             }
         }
     }
@@ -236,9 +316,33 @@ impl Brain for UtilityBrain {
         let Some(surf) = world.surface(p.support) else {
             return Intent::Idle { secs: 0.5, fidget: Gesture::None };
         };
+        if let Some(intent) = self.fight_move(p, &surf, rng) {
+            return intent;
+        }
         let pers = self.personality;
         let (b, e) = (self.needs.boredom, self.needs.energy);
-        let ef = e.max(0.2);
+        // Hurt stickmen are less keen on anything energetic.
+        let ef = e.max(0.2) * p.health.clamp(0.25, 1.0);
+        let hurt = 1.0 - p.health;
+        // Pick a walking style from mood: tired shuffles, playful struts or
+        // skips, mischievous sneaks.
+        let style = {
+            let r = rng.f32();
+            if e < 0.3 {
+                WalkStyle::Shuffle
+            } else if r < 0.15 + pers.playfulness * 0.15 {
+                WalkStyle::Strut
+            } else if r < 0.3 + pers.mischief * 0.15 {
+                WalkStyle::Sneak
+            } else if r < 0.4 + pers.mischief * 0.15 {
+                WalkStyle::March
+            } else if r < 0.5 + pers.playfulness * 0.1 + b * 0.1 {
+                WalkStyle::Skip
+            } else {
+                WalkStyle::Normal
+            }
+        };
+        let walk = |x: f32| Intent::Walk { x, speed: style.speed() * s, style };
         let mut options: Vec<(Kind, Intent, f32)> = Vec::new();
         let inside = matches!(p.support, Support::Inside(_));
 
@@ -258,13 +362,13 @@ impl Brain for UtilityBrain {
         options.push((
             Kind::Sit,
             Intent::Sit { secs: rng.range(3.0, 9.0) },
-            (1.0 - e) * 0.9 + pers.laziness * 0.2 - b * 0.25,
+            (1.0 - e) * 0.9 + pers.laziness * 0.2 - b * 0.25 + hurt * 0.3,
         ));
         let pose = |secs: f32, gesture: Gesture| Intent::Pose { secs, gesture };
         options.push((
             Kind::Sleep,
             pose(rng.range(6.0, 14.0), Gesture::Sleep),
-            (1.0 - e) * 1.1 + pers.laziness * 0.3 - b * 0.3 - 0.35,
+            (1.0 - e) * 1.1 + pers.laziness * 0.3 - b * 0.3 - 0.35 + hurt * 0.7,
         ));
         options.push((
             Kind::Meditate,
@@ -308,48 +412,83 @@ impl Brain for UtilityBrain {
         let margin = 14.0 * s;
         if surf.x1 - surf.x0 > margin * 3.0 {
             let x = rng.range(surf.x0 + margin, surf.x1 - margin);
-            options.push((Kind::Walk, Intent::Walk { x, speed: 85.0 * s }, 0.45 + pers.curiosity * 0.15));
+            options.push((Kind::Walk, walk(x), 0.45 + pers.curiosity * 0.15 - hurt * 0.2));
             let far = if p.hip.x - surf.x0 > surf.x1 - p.hip.x { surf.x0 + margin } else { surf.x1 - margin };
-            options.push((Kind::Run, Intent::Walk { x: far, speed: 330.0 * s }, (b * 0.6 + pers.playfulness * 0.3) * ef));
+            options.push((
+                Kind::Run,
+                Intent::Walk { x: far, speed: 330.0 * s, style: WalkStyle::Normal },
+                (b * 0.6 + pers.playfulness * 0.3) * ef,
+            ));
         }
 
-        // Best jump to another surface, and best jump *into* a window.
-        let mut best_jump: Option<(Intent, f32)> = None;
-        let mut best_enter: Option<(Intent, f32)> = None;
+        // Best jump to another surface. Only arcs that don't clip through a
+        // window count: otherwise it has to go around (climb, drop, taskbar).
+        // Window interiors are reached through the taskbar, not by jumping.
         let foreground = world.windows.first().map(|w| w.id);
-        for t in world.surfaces() {
-            if t.support == p.support || t.x1 - t.x0 < 40.0 * s {
-                continue;
-            }
-            let x = rng.range(t.x0 + 15.0 * s, t.x1 - 15.0 * s);
-            let rise = p.foot.y - t.y;
-            let dx = (x - p.hip.x).abs();
-            if rise > p.max_jump || dx > 650.0 * s || (rise.abs() < 10.0 * s && dx < 30.0 * s) {
-                continue;
-            }
-            let intent = Intent::Jump { target: v2(x, t.y), support: t.support };
-            if let Support::Inside(id) = t.support {
-                let fg = if foreground == Some(id) { 0.15 } else { 0.0 };
-                let score = (0.2 + pers.curiosity * 0.4 + b * 0.3 + fg) * ef - dx / (3000.0 * s) + rng.f32() * 0.1;
-                if best_enter.map_or(true, |(_, bs)| score > bs) {
-                    best_enter = Some((intent, score));
+        if !inside {
+            let mut best_jump: Option<(Intent, f32)> = None;
+            let skip = world.overlapping(p.foot, s);
+            for t in world.surfaces() {
+                if t.support == p.support || matches!(t.support, Support::Inside(_)) || t.x1 - t.x0 < 40.0 * s {
+                    continue;
                 }
-            } else {
-                // Inside a window, leaving is more tempting the more bored we get.
-                let leave = if inside { b * 0.3 } else { 0.0 };
-                let score = (0.3 + b * 0.5 + pers.playfulness * 0.3 + (rise.max(0.0) / p.max_jump) * pers.curiosity * 0.2 + leave) * ef
+                let x = rng.range(t.x0 + 15.0 * s, t.x1 - 15.0 * s);
+                let rise = p.foot.y - t.y;
+                let dx = (x - p.hip.x).abs();
+                if rise > p.max_jump || dx > 650.0 * s || (rise.abs() < 10.0 * s && dx < 30.0 * s) {
+                    continue;
+                }
+                let target = v2(x, t.y);
+                let (vel, flight) = crate::stickman::ballistic(p.foot, target, 35.0 * s, p.gravity);
+                if !world.arc_clear(p.layer, p.foot, vel, p.gravity, flight, s, &skip) {
+                    continue;
+                }
+                let score = (0.3 + b * 0.5 + pers.playfulness * 0.3 + (rise.max(0.0) / p.max_jump) * pers.curiosity * 0.2) * ef
                     - dx / (3000.0 * s)
                     + rng.f32() * 0.1;
                 if best_jump.map_or(true, |(_, bs)| score > bs) {
-                    best_jump = Some((intent, score));
+                    best_jump = Some((Intent::Jump { target, support: t.support }, score));
                 }
             }
+            if let Some((i, sc)) = best_jump {
+                options.push((Kind::Jump, i, sc));
+            }
         }
-        if let Some((i, sc)) = best_jump {
-            options.push((Kind::Jump, i, sc));
+
+        // Taskbar travel: dive into the taskbar, pop out on/in another window.
+        if p.support == Support::Floor && world.portal_edge().is_some() {
+            let mut best_portal: Option<(Intent, f32)> = None;
+            for w in &world.windows {
+                for target in [Support::Inside(w.id), Support::Window(w.id)] {
+                    if world.surface(target).is_none() {
+                        continue;
+                    }
+                    let fg = if foreground == Some(w.id) { 0.15 } else { 0.0 };
+                    let room = if matches!(target, Support::Inside(_)) { pers.curiosity * 0.15 } else { 0.0 };
+                    let score = (0.15 + pers.curiosity * 0.35 + b * 0.35 + fg + room) * ef + rng.f32() * 0.15;
+                    if best_portal.map_or(true, |(_, bs)| score > bs) {
+                        best_portal = Some((Intent::Portal { target }, score));
+                    }
+                }
+            }
+            if let Some((i, sc)) = best_portal {
+                options.push((Kind::Enter, i, sc));
+            }
         }
-        if let Some((i, sc)) = best_enter {
-            options.push((Kind::Enter, i, sc));
+
+        // Inside a window: climb its inner wall and out over the top.
+        if let Support::Inside(id) = p.support {
+            if world.surface(Support::Window(id)).is_some() {
+                for side in [Side::Left, Side::Right] {
+                    if world.wall_x(id, side).is_some() {
+                        options.push((
+                            Kind::Climb,
+                            Intent::Climb { win: id, side, inner: true },
+                            (0.15 + pers.curiosity * 0.3 + b * 0.4) * ef + rng.f32() * 0.1,
+                        ));
+                    }
+                }
+            }
         }
 
         // Best window side to climb (from outside windows only).
@@ -371,7 +510,7 @@ impl Brain for UtilityBrain {
                     let score = (0.3 + pers.curiosity * 0.4 + b * 0.35) * ef - (stand - p.hip.x).abs() / (2500.0 * s)
                         + rng.f32() * 0.1;
                     if best_climb.map_or(true, |(_, bs)| score > bs) {
-                        best_climb = Some((Intent::Climb { win: w.id, side }, score));
+                        best_climb = Some((Intent::Climb { win: w.id, side, inner: false }, score));
                     }
                 }
             }
@@ -383,7 +522,7 @@ impl Brain for UtilityBrain {
         // Step off the edge of the window we're on.
         if let Support::Window(_) = p.support {
             let x = if rng.chance(0.5) { surf.x0 - 12.0 * s } else { surf.x1 + 12.0 * s };
-            options.push((Kind::Drop, Intent::Walk { x, speed: 110.0 * s }, 0.12 + pers.mischief * 0.35 + b * 0.2));
+            options.push((Kind::Drop, walk(x), 0.12 + pers.mischief * 0.35 + b * 0.2 - hurt * 0.3));
         }
 
         // The cursor: wave at it, follow it, or jump up and grab it.
@@ -396,12 +535,13 @@ impl Brain for UtilityBrain {
         {
             options.push((
                 Kind::Follow,
-                Intent::Walk { x: p.cursor.x, speed: 150.0 * s },
+                Intent::Walk { x: p.cursor.x, speed: 150.0 * s, style: WalkStyle::Normal },
                 pers.curiosity * 0.35 + b * 0.1,
             ));
         }
         let above = p.foot.y - p.cursor.y;
         if p.allow_cursor
+            && !inside
             && above > p.reach + 10.0 * s
             && above < p.max_jump + p.reach
             && to_cursor.x.abs() < 250.0 * s
@@ -441,7 +581,7 @@ impl Brain for UtilityBrain {
                 let speed = if grudge > 0.2 { 300.0 } else { 120.0 } * s;
                 options.push((
                     Kind::Approach,
-                    Intent::Walk { x: peer.hip.x - dir * 18.0 * s, speed },
+                    Intent::Walk { x: peer.hip.x - dir * 18.0 * s, speed, style: WalkStyle::Normal },
                     0.15 + pers.curiosity * 0.25 + grudge * 0.6,
                 ));
             }
@@ -461,6 +601,15 @@ impl Brain for UtilityBrain {
             }
         }
         self.commit(best.0);
+        // Throwing the first punch/kick at someone starts a proper fight.
+        let opened = match best.1 {
+            Intent::Punch { target, .. } | Intent::Kick { target: Some(target), .. } => Some(target),
+            _ => None,
+        };
+        if let Some(target) = opened {
+            let secs = rng.range(5.0, 9.0) + self.grudge_against(target) * 4.0;
+            self.start_fight(target, secs);
+        }
         best.1
     }
 }

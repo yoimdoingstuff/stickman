@@ -95,6 +95,11 @@ impl Rect {
     pub fn width(&self) -> f32 {
         self.r - self.l
     }
+
+    /// Strict overlap (touching edges don't count).
+    pub fn overlaps(&self, o: &Rect) -> bool {
+        self.l < o.r && self.r > o.l && self.t < o.b && self.b > o.t
+    }
 }
 
 /// Damped spring on a single value. `freq` is in Hz, `damping` 1.0 = critical.

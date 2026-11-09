@@ -36,14 +36,75 @@ pub enum Gesture {
 
 impl Gesture {
     /// Poses that bring the hips down to the ground.
-    fn is_low(self) -> bool {
+    pub fn is_low(self) -> bool {
         matches!(self, Gesture::Meditate | Gesture::PushUp | Gesture::Sleep | Gesture::EdgeSit)
+    }
+}
+
+/// How it walks. Each style is a set of tweaks to the same procedural gait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkStyle {
+    Normal,
+    /// Crouched tiptoe with hands up, cartoon-burglar style.
+    Sneak,
+    /// Leaning back, big arm swing, bouncy.
+    Strut,
+    /// High knees, stiff arms.
+    March,
+    /// Hoppy.
+    Skip,
+    /// Tired: small slow steps, slumped.
+    Shuffle,
+    /// Hurt: one leg favoured, hip dips.
+    Limp,
+    /// Badly hurt: on hands and knees.
+    Crawl,
+}
+
+impl WalkStyle {
+    /// Natural walking speed at scale 1 (px/s).
+    pub fn speed(self) -> f32 {
+        match self {
+            WalkStyle::Normal => 85.0,
+            WalkStyle::Sneak => 50.0,
+            WalkStyle::Strut => 95.0,
+            WalkStyle::March => 75.0,
+            WalkStyle::Skip => 140.0,
+            WalkStyle::Shuffle => 45.0,
+            WalkStyle::Limp => 40.0,
+            WalkStyle::Crawl => 22.0,
+        }
+    }
+}
+
+/// Gait tweaks: hip drop (px at scale 1), step lift/length/duration
+/// multipliers, forward lean (rad), arm swing multiplier, hop amount.
+struct Gait {
+    hip: f32,
+    lift: f32,
+    stride: f32,
+    dur: f32,
+    lean: f32,
+    swing: f32,
+    bounce: f32,
+}
+
+fn gait(style: WalkStyle) -> Gait {
+    let g = |hip, lift, stride, dur, lean, swing, bounce| Gait { hip, lift, stride, dur, lean, swing, bounce };
+    match style {
+        WalkStyle::Normal | WalkStyle::Crawl => g(0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0),
+        WalkStyle::Sneak => g(7.0, 0.7, 0.8, 1.4, 0.22, 0.2, 0.0),
+        WalkStyle::Strut => g(-1.0, 1.2, 1.1, 1.0, -0.1, 1.6, 1.2),
+        WalkStyle::March => g(0.0, 2.6, 1.0, 1.3, -0.04, 1.8, 0.4),
+        WalkStyle::Skip => g(0.0, 1.6, 1.3, 0.9, 0.05, 1.2, 3.0),
+        WalkStyle::Shuffle => g(2.0, 0.35, 0.6, 1.5, 0.18, 0.3, 0.0),
+        WalkStyle::Limp => g(1.0, 0.6, 0.7, 1.5, 0.12, 0.5, 0.0),
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum RigState {
-    Stand { ground_y: f32, sit: bool, gesture: Gesture },
+    Stand { ground_y: f32, sit: bool, gesture: Gesture, style: WalkStyle },
     Air,
     Climb { wall_x: f32 },
     Mantle { wall_x: f32, top_y: f32 },
@@ -171,6 +232,12 @@ fn step_pair(
     }
 }
 
+/// Smooth, never-repeating wobble in roughly -1..1 (three detuned sines).
+/// `k` offsets it so different body parts and stickmen don't move in sync.
+fn wobble(t: f32, k: f32) -> f32 {
+    (t + k).sin() * 0.5 + (t * 2.31 + k * 1.7).sin() * 0.3 + (t * 4.13 + k * 2.9).sin() * 0.2
+}
+
 /// Two-bone IK. Returns (middle joint, end point). `bend` picks which way the
 /// joint points (+1 = toward +x when the limb hangs down).
 fn ik(root: Vec2, target: Vec2, a: f32, b: f32, bend: f32) -> (Vec2, Vec2) {
@@ -194,6 +261,8 @@ pub struct Rig {
     tilt: Spring,
     kind: u8,
     init: bool,
+    /// Per-stickman phase so idles don't look identical.
+    seed: f32,
     pub pose: Pose,
 }
 
@@ -209,6 +278,10 @@ impl Rig {
             tilt: Spring::default(),
             kind: 255,
             init: false,
+            seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.subsec_nanos() % 100_000) as f32 * 0.001)
+                .unwrap_or(0.0),
             pose: Pose::default(),
         }
     }
@@ -270,6 +343,12 @@ impl Rig {
 
         let speed = inp.vel.x.abs();
         let run = (speed / (300.0 * s)).min(1.0);
+        let seed = self.seed;
+        // How "standing still" we are: drives all the idle noise.
+        let idle_k = match inp.state {
+            RigState::Stand { .. } => 1.0 - (speed / (40.0 * s)).min(1.0),
+            _ => 0.0,
+        };
         let fall_k = (inp.vel.y / (900.0 * s)).clamp(0.0, 1.0);
         let rising = inp.vel.y < -30.0 * s;
         let mut hip = inp.hip;
@@ -277,16 +356,32 @@ impl Rig {
 
         // ---- hips, legs and lean ----
         match inp.state {
-            RigState::Stand { ground_y, .. } => {
+            RigState::Stand { ground_y, style: WalkStyle::Crawl, .. } => {
+                // On hands and knees: body nearly horizontal, low to the floor.
+                let bob = -(self.feet[0].lift_amount() + self.hands[0].lift_amount()) * s;
+                hip.y = ground_y - 7.0 * s + bob + self.squash.x.max(0.0) * 0.3;
+                let ideal = [v2(hip.x - f * 22.0 * s, ground_y), v2(hip.x - f * 18.0 * s, ground_y)];
+                let lead = v2(inp.vel.x * 0.25, 0.0);
+                step_pair(&mut self.feet, ideal, lead, 6.0 * s, 0.4, v2(0.0, -2.0 * s), snap, dt);
+                lean_target = f * 1.3;
+            }
+            RigState::Stand { ground_y, style, .. } => {
+                let g = gait(style);
                 let sitk = self.sit.x.clamp(0.0, 1.0);
                 let drop = self.crouch.x * d.stance * 0.38
                     + self.squash.x.max(-4.0 * s)
                     + run * 2.5 * s
-                    + sitk * (d.stance - 7.0 * s);
-                let bob = -(self.feet[0].lift_amount() + self.feet[1].lift_amount())
+                    + sitk * (d.stance - 7.0 * s)
+                    + g.hip * s * (1.0 - sitk);
+                let mut bob = -(self.feet[0].lift_amount() + self.feet[1].lift_amount())
                     * (1.0 + run * 1.5)
+                    * (1.0 + g.bounce)
                     * s
                     + (t * 2.1).sin() * 0.4 * s * (1.0 - run);
+                if style == WalkStyle::Limp {
+                    // Weight drops onto the bad leg (foot 0) while the good one swings.
+                    bob += self.feet[1].lift_amount() * 3.5 * s;
+                }
                 let groove = if dance { -(t * 7.0).sin().abs() * 2.5 * s } else { 0.0 };
                 // Fine-tune hip height for the low poses (relative to sitting).
                 let low = sitk
@@ -299,6 +394,8 @@ impl Rig {
                     };
                 hip.y += drop + bob + groove + low;
                 hip.x -= f * self.crouch.x * 2.0 * s;
+                // Weight slowly shifting from foot to foot (feet re-step when it drifts far).
+                hip.x += wobble(t * 0.35, seed) * 2.5 * s * idle_k * (1.0 - sitk);
 
                 if sitk > 0.5 && gesture.is_low() {
                     for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
@@ -325,13 +422,15 @@ impl Rig {
                     } else if dance {
                         4.5 * s * (1.0 + 0.8 * (t * 3.5).sin())
                     } else {
-                        4.5 * s
+                        // Stance width drifts a little too.
+                        4.5 * s * (1.0 + 0.35 * wobble(t * 0.15, seed + 3.0))
                     };
+                    let base = base + wobble(t * 0.35, seed) * 2.5 * s * idle_k;
                     let ideal = [v2(base - spread, ground_y), v2(base + spread, ground_y)];
-                    let threshold = if moving { 8.0 * s + speed * 0.05 } else { 3.0 * s };
-                    let dur = (0.26 - speed / s * 0.000_38).clamp(0.11, 0.26);
+                    let threshold = if moving { (8.0 * s + speed * 0.05) * g.stride } else { 3.0 * s };
+                    let dur = ((0.26 - speed / s * 0.000_38) * g.dur).clamp(0.11, 0.4);
                     let lead = v2(inp.vel.x * dur * 0.55, 0.0);
-                    let lift = v2(0.0, -(3.5 * s + speed * 0.03));
+                    let lift = v2(0.0, -(3.5 * s + speed * 0.03) * g.lift);
                     step_pair(&mut self.feet, ideal, lead, threshold, dur, lift, snap, dt);
                     match gesture {
                         Gesture::TapFoot if !self.feet[1].stepping => {
@@ -349,7 +448,11 @@ impl Rig {
                         _ => {}
                     }
                 }
-                let base_lean = (inp.vel.x / s * 0.0008).clamp(-0.32, 0.32) + f * self.crouch.x * 0.3;
+                let walking = (speed / (40.0 * s)).min(1.0);
+                let base_lean = (inp.vel.x / s * 0.0008).clamp(-0.32, 0.32)
+                    + f * self.crouch.x * 0.3
+                    + f * g.lean * walking
+                    + wobble(t * 0.25, seed + 5.0) * 0.06 * idle_k;
                 lean_target = match gesture {
                     Gesture::Sleep => -f * 1.45 * sitk,
                     Gesture::PushUp => f * 1.3 * sitk,
@@ -395,26 +498,47 @@ impl Rig {
             RigState::Air => (-inp.vel.y / (2500.0 * s)).clamp(-0.08, 0.12),
             _ => 0.0,
         } - (self.squash.x / d.stance).clamp(0.0, 0.3) * 0.5;
-        let chest = hip + up * (d.torso * (1.0 + stretch));
+        // Breathing: the chest rises and falls at a slowly varying rate.
+        let breath = (t * (2.0 + wobble(t * 0.1, seed + 9.0) * 0.4)).sin() * 0.025 * idle_k;
+        let chest = hip + up * (d.torso * (1.0 + stretch + breath));
         let neck = chest + up * d.neck;
-        self.tilt.update(f * 0.12 + a * 0.4, 2.5, 0.5, dt);
+        // Head drifts around on its own (looking about, little nods).
+        let drift = wobble(t * 0.4, seed + 7.0) * 0.22 * idle_k;
+        self.tilt.update(f * 0.12 + a * 0.4 + drift, 2.5, 0.5, dt);
         let head = neck + v2(self.tilt.x.sin(), -self.tilt.x.cos()) * d.head_r;
 
         // ---- arms ----
         let arm = d.arm();
         let mut elbow_bend = -f;
         match inp.state {
-            RigState::Stand { ground_y, .. } => {
+            RigState::Stand { ground_y, style: WalkStyle::Crawl, .. } => {
+                let ideal = [v2(chest.x + f * 3.0 * s, ground_y), v2(chest.x + f * 7.0 * s, ground_y)];
+                let lead = v2(inp.vel.x * 0.25, 0.0);
+                step_pair(&mut self.hands, ideal, lead, 6.0 * s, 0.35, v2(0.0, -3.0 * s), snap, dt);
+            }
+            RigState::Stand { ground_y, style, .. } => {
+                let g = gait(style);
+                let walking = (speed / (40.0 * s)).min(1.0);
                 let sitk = self.sit.x.clamp(0.0, 1.0);
                 for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
                     let fi = i as f32;
-                    let swing = (self.feet[1 - i].pos.x - hip.x) * 0.75;
+                    let swing = (self.feet[1 - i].pos.x - hip.x) * 0.75 * g.swing;
                     let mut target = chest
                         + v2(
                             swing * (1.0 + run * 0.3) + side * 2.0 * s + f * s,
                             arm * (0.88 - run * 0.3) - swing.abs() * 0.15 + (t * 2.1).sin() * 0.4 * s,
                         );
                     target.x -= f * self.crouch.x * 7.0 * s;
+                    // Idle arms sway and fidget slightly, each on its own rhythm.
+                    target += v2(
+                        wobble(t * 0.5, seed + 11.0 + fi * 3.0) * 2.0 * s,
+                        wobble(t * 0.6, seed + 13.0 + fi * 3.0) * 1.5 * s,
+                    ) * idle_k;
+                    if style == WalkStyle::Sneak && walking > 0.0 {
+                        // Hands creeping up in front.
+                        let creep = chest + v2(f * (5.0 + fi * 3.0) * s, s + (t * 6.0 + fi * PI).sin() * 1.5 * s);
+                        target = target.lerp(creep, walking);
+                    }
                     if sitk > 0.3 {
                         target = target.lerp(self.pose.knees[i] + v2(0.0, -s), sitk);
                     }
@@ -446,11 +570,20 @@ impl Rig {
                             freq = 8.0;
                         }
                         Gesture::Stretch => {
-                            target = chest + v2(side * 4.0 * s + f * 2.0 * s + (t * 2.0 + fi).sin() * s, -arm * 0.92);
+                            target = chest
+                                + v2(
+                                    side * 4.0 * s + f * 2.0 * s + wobble(t * 1.3, seed + fi * 5.0) * 2.0 * s,
+                                    -arm * (0.88 + 0.06 * wobble(t * 0.9, seed + fi)),
+                                );
                             freq = 3.0;
                         }
                         Gesture::Scratch if i == 1 => {
-                            target = head + v2(f * 2.0 * s + (t * 22.0).sin() * 1.5 * s, -d.head_r * 0.6);
+                            let rate = 20.0 + wobble(t * 0.7, seed + 17.0) * 6.0;
+                            target = head
+                                + v2(
+                                    f * 2.0 * s + (t * rate).sin() * 1.5 * s,
+                                    -d.head_r * (0.6 + 0.3 * wobble(t * 0.5, seed + 19.0)),
+                                );
                             freq = 9.0;
                         }
                         Gesture::TapFoot => {
