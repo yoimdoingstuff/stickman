@@ -8,8 +8,15 @@ description = "A procedurally animated stickman that lives on your desktop"
 tiny-skia = "0.11"
 
 [target.'cfg(windows)'.dependencies]
+# Only for UI Automation (COM): reading the taskbar's buttons.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Threading",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",

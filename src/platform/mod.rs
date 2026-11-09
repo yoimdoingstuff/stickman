@@ -53,8 +53,37 @@ pub trait Platform {
     /// Open a colour picker. Returns the chosen RGB, or None if cancelled.
     fn pick_color(&mut self, initial: [u8; 3]) -> Option<[u8; 3]>;
     fn keep_on_top(&mut self);
+
+    /// (name, screen rect) of each app button on the taskbar.
+    fn taskbar_buttons(&mut self) -> Vec<(String, Rect)>;
+    fn window_title(&self, id: WinId) -> String;
+    /// (process id, lowercase exe file name) of the process owning a window.
+    fn window_process(&self, id: WinId) -> Option<(u32, String)>;
+    fn foreground(&self) -> Option<WinId>;
+    /// A window's client area (no frame/title bar) in screen pixels.
+    fn client_rect(&self, id: WinId) -> Option<Rect>;
+    /// Grab what's on screen in `r` (the stickman itself is left out).
+    fn capture(&mut self, r: Rect) -> Option<Image>;
+    /// Left-click a window at a screen position, without moving your mouse.
+    fn post_click(&self, id: WinId, at: Vec2);
 }
 
+/// Plain RGBA image (not premultiplied; screen captures are opaque).
+pub struct Image {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl Image {
+    pub fn px(&self, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y.min(self.h - 1) * self.w + x.min(self.w - 1)) * 4) as usize;
+        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2]]
+    }
+}
+
+#[cfg(windows)]
+mod uia;
 #[cfg(windows)]
 mod win32;
 

@@ -13,11 +13,24 @@ pub struct Settings {
     pub grab_cursor: bool,
     /// Gravity multiplier (1.0 = normal).
     pub gravity: f32,
+    /// Stomp open a safe Minesweeper tile every few of your moves.
+    pub minesweeper_help: bool,
+    /// ...and sometimes pick a risky one (off by default: then it never
+    /// makes you lose).
+    pub minesweeper_mistakes: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { color: [0, 0, 0], outline: true, stay_in_front: false, grab_cursor: true, gravity: 1.0 }
+        Settings {
+            color: [0, 0, 0],
+            outline: true,
+            stay_in_front: false,
+            grab_cursor: true,
+            gravity: 1.0,
+            minesweeper_help: true,
+            minesweeper_mistakes: false,
+        }
     }
 }
 
@@ -56,6 +69,8 @@ impl Settings {
                 "outline" => s.outline = flag,
                 "stay_in_front" => s.stay_in_front = flag,
                 "grab_cursor" => s.grab_cursor = flag,
+                "minesweeper_help" => s.minesweeper_help = flag,
+                "minesweeper_mistakes" => s.minesweeper_mistakes = flag,
                 "gravity" => {
                     if let Ok(g) = value.trim().parse::<f32>() {
                         s.gravity = g.clamp(0.1, 5.0);
@@ -73,12 +88,14 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\ngravity={}\n",
+            "color={}\noutline={}\nstay_in_front={}\ngrab_cursor={}\ngravity={}\nminesweeper_help={}\nminesweeper_mistakes={}\n",
             to_hex(self.color),
             self.outline,
             self.stay_in_front,
             self.grab_cursor,
-            self.gravity
+            self.gravity,
+            self.minesweeper_help,
+            self.minesweeper_mistakes
         );
         let _ = std::fs::write(p, text);
     }

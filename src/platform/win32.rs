@@ -6,7 +6,15 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{BitBlt, ClientToScreen, ScreenToClient, SRCCOPY};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GetClientRect, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsZoomed,
+    SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEMOVE,
+};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -40,7 +48,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use super::{Event, MenuItem, Platform};
+use super::uia::Uia;
+use super::{Event, Image, MenuItem, Platform};
 use crate::math::{v2, Rect, Vec2};
 use crate::world::{Edge, Taskbar, WinId, WinInfo};
 
@@ -121,6 +130,8 @@ pub struct Win32Platform {
     shown: bool,
     /// The 16 "custom colours" slots in the picker, kept for the session.
     custom_colors: [u32; 16],
+    /// UI Automation, created the first time it's needed.
+    uia: Option<Uia>,
 }
 
 impl Win32Platform {
@@ -164,6 +175,9 @@ impl Win32Platform {
             if hwnd.is_null() {
                 return Err("CreateWindowExW failed".into());
             }
+            // Keep the stickman out of screen captures (so reading a game
+            // board isn't confused by the stickman standing on it).
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
             let screen = GetDC(null_mut());
             let mem_dc = CreateCompatibleDC(screen);
             ReleaseDC(null_mut(), screen);
@@ -176,6 +190,7 @@ impl Win32Platform {
                 h: 0,
                 shown: false,
                 custom_colors: [0x00FF_FFFF; 16],
+                uia: None,
             })
         }
     }
@@ -232,7 +247,12 @@ impl Win32Platform {
         if rect.r - rect.l < 60.0 || rect.b - rect.t < 40.0 {
             return None;
         }
-        Some(WinInfo { id: h as usize as WinId, rect })
+        // Maximized (or covering the whole work area): it's effectively the
+        // background, not something to climb or stand on.
+        let work = self.work_area();
+        let covers = rect.l <= work.l + 8.0 && rect.t <= work.t + 8.0 && rect.r >= work.r - 8.0 && rect.b >= work.b - 8.0;
+        let maximized = IsZoomed(h) != 0 || covers;
+        Some(WinInfo { id: h as usize as WinId, rect, maximized })
     }
 }
 
@@ -418,6 +438,130 @@ impl Platform for Win32Platform {
             } else {
                 None
             }
+        }
+    }
+
+    fn taskbar_buttons(&mut self) -> Vec<(String, Rect)> {
+        if self.uia.is_none() {
+            self.uia = Uia::new();
+        }
+        let class = wide("Shell_TrayWnd");
+        let tray = unsafe { FindWindowW(class.as_ptr(), null()) };
+        match &self.uia {
+            Some(u) => u.taskbar_buttons(tray),
+            None => Vec::new(),
+        }
+    }
+
+    fn window_title(&self, id: WinId) -> String {
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetWindowTextW(id as usize as HWND, buf.as_mut_ptr(), buf.len() as i32) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    fn window_process(&self, id: WinId) -> Option<(u32, String)> {
+        unsafe {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(id as usize as HWND, &mut pid);
+            if pid == 0 {
+                return None;
+            }
+            let hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if hp.is_null() {
+                return Some((pid, String::new()));
+            }
+            let mut buf = [0u16; 520];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(hp, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+            CloseHandle(hp);
+            if !ok {
+                return Some((pid, String::new()));
+            }
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            let exe = path.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("").to_lowercase();
+            Some((pid, exe))
+        }
+    }
+
+    fn foreground(&self) -> Option<WinId> {
+        let h = unsafe { GetForegroundWindow() };
+        (!h.is_null()).then(|| h as usize as WinId)
+    }
+
+    fn client_rect(&self, id: WinId) -> Option<Rect> {
+        let h = id as usize as HWND;
+        unsafe {
+            let mut rc: RECT = zeroed();
+            if GetClientRect(h, &mut rc) == 0 {
+                return None;
+            }
+            let mut tl = POINT { x: 0, y: 0 };
+            let mut br = POINT { x: rc.right, y: rc.bottom };
+            ClientToScreen(h, &mut tl);
+            ClientToScreen(h, &mut br);
+            Some(Rect { l: tl.x as f32, t: tl.y as f32, r: br.x as f32, b: br.y as f32 })
+        }
+    }
+
+    fn capture(&mut self, r: Rect) -> Option<Image> {
+        let (x, y) = (r.l.round() as i32, r.t.round() as i32);
+        let (w, h) = ((r.r - r.l).round() as i32, (r.b - r.t).round() as i32);
+        if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+            return None;
+        }
+        unsafe {
+            let screen = GetDC(null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let mut bmi: BITMAPINFO = zeroed();
+            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            let mut bits: *mut c_void = null_mut();
+            let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bmp.is_null() || bits.is_null() {
+                DeleteDC(dc);
+                ReleaseDC(null_mut(), screen);
+                return None;
+            }
+            let old = SelectObject(dc, bmp);
+            let ok = BitBlt(dc, 0, 0, w, h, screen, x, y, SRCCOPY) != 0;
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            if ok {
+                let src = std::slice::from_raw_parts(bits as *const u8, rgba.len());
+                for (d, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = 255;
+                }
+            }
+            SelectObject(dc, old);
+            DeleteObject(bmp);
+            DeleteDC(dc);
+            ReleaseDC(null_mut(), screen);
+            ok.then_some(Image { w: w as u32, h: h as u32, rgba })
+        }
+    }
+
+    fn post_click(&self, id: WinId, at: Vec2) {
+        let h = id as usize as HWND;
+        unsafe {
+            let mut pt = POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
+            ScreenToClient(h, &mut pt);
+            // Old games are usually not DPI-aware: their messages use
+            // unscaled coordinates.
+            let ours = GetDpiForWindow(self.hwnd).max(1) as f32;
+            let theirs = GetDpiForWindow(h).max(1) as f32;
+            let k = theirs / ours;
+            let cx = (pt.x as f32 * k).round() as i32;
+            let cy = (pt.y as f32 * k).round() as i32;
+            let lp = (((cy as u32 & 0xFFFF) << 16) | (cx as u32 & 0xFFFF)) as LPARAM;
+            PostMessageW(h, WM_MOUSEMOVE, 0, lp);
+            PostMessageW(h, WM_LBUTTONDOWN, 1, lp);
+            PostMessageW(h, WM_LBUTTONUP, 0, lp);
         }
     }
 

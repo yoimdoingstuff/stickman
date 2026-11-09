@@ -53,6 +53,11 @@ pub struct Ragdoll {
     last_dt: f32,
     /// Window the body is trapped inside (if it went limp in one).
     pub room: Option<WinId>,
+    /// Windows the body was already overlapping (not solid); worked out on
+    /// the first step after it starts moving freely.
+    ignore: Option<Vec<WinId>>,
+    /// False while being dragged, so you can pull it anywhere.
+    solid: bool,
 }
 
 impl Ragdoll {
@@ -75,7 +80,24 @@ impl Ragdoll {
         for q in prev.iter_mut() {
             *q -= vel * dt;
         }
-        Ragdoll { p, prev, pins: Vec::new(), anchor: Vec2::ZERO, still: 0.0, last_dt: dt, room }
+        Ragdoll {
+            p,
+            prev,
+            pins: Vec::new(),
+            anchor: Vec2::ZERO,
+            still: 0.0,
+            last_dt: dt,
+            room,
+            ignore: None,
+            solid: true,
+        }
+    }
+
+    /// Being dragged by the user: pass through windows. When let go, the
+    /// windows it's overlapping at that moment stay non-solid.
+    pub fn set_held(&mut self, held: bool) {
+        self.solid = !held;
+        self.ignore = None;
     }
 
     pub fn hip(&self) -> Vec2 {
@@ -152,6 +174,25 @@ impl Ragdoll {
         let surfaces: Vec<Surface> =
             world.surfaces().into_iter().filter(|s| world.can_land(s, layer, None)).collect();
         let room = self.room.and_then(|id| world.window(id)).map(|w| w.rect);
+        let solids: Vec<Rect> = if self.solid {
+            let pts = self.p;
+            let ignore = self.ignore.get_or_insert_with(|| {
+                world
+                    .windows
+                    .iter()
+                    .filter(|w| pts.iter().any(|q| q.x > w.rect.l && q.x < w.rect.r && q.y > w.rect.t && q.y < w.rect.b))
+                    .map(|w| w.id)
+                    .collect()
+            });
+            world
+                .solids(layer)
+                .into_iter()
+                .filter(|(id, _)| !ignore.contains(id) && Some(*id) != self.room)
+                .map(|(_, r)| r)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let links = links(d);
         let mut inv = [1.0f32; N];
         for &(i, _) in &self.pins {
@@ -177,7 +218,7 @@ impl Ragdoll {
                 self.p[a] += corr * inv[a];
                 self.p[b] -= corr * inv[b];
             }
-            self.collide(&start, &surfaces, world.work, room, d, &mut grounded);
+            self.collide(&start, &surfaces, &solids, world.work, room, d, &mut grounded);
         }
         for &(i, off) in &self.pins {
             self.p[i] = self.anchor + off;
@@ -199,10 +240,12 @@ impl Ragdoll {
         self.last_dt = dt;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collide(
         &mut self,
         start: &[Vec2; N],
         surfaces: &[Surface],
+        solids: &[Rect],
         work: Rect,
         room: Option<Rect>,
         d: &Dims,
@@ -211,6 +254,26 @@ impl Ragdoll {
         for i in 0..N {
             let r = if i == HEAD { d.head_r } else { d.stroke * 0.6 };
             let mut q = self.p[i];
+            // Bounce off the sides/bottom of solid windows (pushed back out
+            // the way it came in).
+            for w in solids {
+                let (l, t, rr, b) = (w.l - r, w.t - r, w.r + r, w.b + r);
+                if !(q.x > l && q.x < rr && q.y > t && q.y < b) {
+                    continue;
+                }
+                let s0 = start[i];
+                if s0.y <= t {
+                    q.y = t;
+                    grounded[i] = true;
+                } else if s0.y >= b {
+                    q.y = b;
+                } else if s0.x <= l {
+                    q.x = l;
+                } else if s0.x >= rr {
+                    q.x = rr;
+                }
+            }
+            let mut q = q;
             for s in surfaces {
                 if q.x >= s.x0 && q.x <= s.x1 && start[i].y + r <= s.y + 1.0 && q.y + r > s.y {
                     q.y = s.y - r;

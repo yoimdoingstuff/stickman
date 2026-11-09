@@ -32,6 +32,8 @@ pub enum Gesture {
     Sleep,
     /// Sitting on a ledge with legs dangling over it (facing the drop).
     EdgeSit,
+    /// Arms windmilling, trying not to fall off a moving window.
+    Balance,
 }
 
 impl Gesture {
@@ -263,6 +265,10 @@ pub struct Rig {
     init: bool,
     /// Per-stickman phase so idles don't look identical.
     seed: f32,
+    /// Which way it sits on the ground this time: legs out leaning back on
+    /// its hands, or knees up with hands on knees. Picked when it sits down.
+    legs_out: bool,
+    was_sitting: bool,
     pub pose: Pose,
 }
 
@@ -282,6 +288,8 @@ impl Rig {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| (d.subsec_nanos() % 100_000) as f32 * 0.001)
                 .unwrap_or(0.0),
+            legs_out: false,
+            was_sitting: false,
             pose: Pose::default(),
         }
     }
@@ -337,7 +345,13 @@ impl Rig {
 
         self.crouch.update(inp.crouch, 5.0, 0.7, dt);
         self.squash.update(0.0, 4.5, 0.45, dt);
-        let sitting = matches!(inp.state, RigState::Stand { sit: true, .. }) || gesture.is_low();
+        let plain_sit = matches!(inp.state, RigState::Stand { sit: true, .. }) && !gesture.is_low();
+        let sitting = plain_sit || gesture.is_low();
+        if plain_sit && !self.was_sitting {
+            self.legs_out = (t * 12.9898 + self.seed * 78.233).sin() > 0.0;
+        }
+        self.was_sitting = plain_sit;
+        let legs_out = self.legs_out;
         let pump = 0.5 + 0.5 * (t * 4.5).sin();
         self.sit.update(if sitting { 1.0 } else { 0.0 }, 2.2, 0.9, dt);
 
@@ -371,8 +385,10 @@ impl Rig {
                 let drop = self.crouch.x * d.stance * 0.38
                     + self.squash.x.max(-4.0 * s)
                     + run * 2.5 * s
-                    + sitk * (d.stance - 7.0 * s)
-                    + g.hip * s * (1.0 - sitk);
+                    // Sitting: bottom actually on the ground.
+                    + sitk * (d.stance - 2.0 * s)
+                    + g.hip * s * (1.0 - sitk)
+                    + (if gesture == Gesture::Balance { 2.5 * s } else { 0.0 });
                 let mut bob = -(self.feet[0].lift_amount() + self.feet[1].lift_amount())
                     * (1.0 + run * 1.5)
                     * (1.0 + g.bounce)
@@ -386,10 +402,10 @@ impl Rig {
                 // Fine-tune hip height for the low poses (relative to sitting).
                 let low = sitk
                     * match gesture {
-                        Gesture::Sleep => 4.0 * s,
-                        Gesture::PushUp => 2.0 * s - pump * 5.0 * s,
-                        Gesture::Meditate => -(5.0 + (t * 1.6).sin() * 2.0) * s,
-                        Gesture::EdgeSit => 4.0 * s,
+                        Gesture::Sleep => -1.0 * s,
+                        Gesture::PushUp => -3.0 * s - pump * 5.0 * s,
+                        Gesture::Meditate => -(10.0 + (t * 1.6).sin() * 2.0) * s,
+                        Gesture::EdgeSit => -1.0 * s,
                         _ => 0.0,
                     };
                 hip.y += drop + bob + groove + low;
@@ -404,15 +420,24 @@ impl Rig {
                             Gesture::Sleep => v2(hip.x + f * (25.0 + fi * 2.0) * s, ground_y - s),
                             Gesture::PushUp => v2(hip.x - f * (26.0 + fi * 2.0) * s, ground_y - s),
                             Gesture::Meditate => hip + v2(side * 7.0 * s + f * 2.0 * s, 7.0 * s),
-                            _ => v2(
-                                hip.x + f * 7.0 * s + (t * 2.5 + fi * PI).sin() * 3.0 * s,
-                                ground_y + 15.0 * s,
-                            ),
+                            _ => {
+                                // Legs over the ledge. Every so often it
+                                // swings them, in little bursts.
+                                let swing = (wobble(t * 0.3, seed + 21.0) * 1.6).clamp(0.0, 1.0);
+                                let rate = 2.6 + wobble(t * 0.2, seed + 23.0) * 0.8;
+                                let ph = t * rate + fi * PI;
+                                v2(
+                                    hip.x + f * 7.0 * s + ph.sin() * 3.5 * s * swing + wobble(t * 0.4, seed + fi) * 0.6 * s,
+                                    ground_y + 15.0 * s - ph.cos().max(0.0) * 2.5 * s * swing,
+                                )
+                            }
                         };
                         self.feet[i].follow(target, 6.0, 0.8, dt);
                     }
                 } else if sitk > 0.5 {
-                    let ideal = [v2(hip.x + f * 13.0 * s, ground_y), v2(hip.x + f * 16.0 * s, ground_y)];
+                    // Sitting on the ground: knees up, or legs stretched out.
+                    let reach = if legs_out { 27.0 } else { 13.0 };
+                    let ideal = [v2(hip.x + f * reach * s, ground_y), v2(hip.x + f * (reach + 2.0) * s, ground_y)];
                     step_pair(&mut self.feet, ideal, Vec2::ZERO, 3.0 * s, 0.2, v2(0.0, -3.0 * s), snap, dt);
                 } else {
                     let moving = speed > 15.0 * s;
@@ -461,6 +486,8 @@ impl Rig {
                     Gesture::Punch(e) => base_lean + f * e * 0.15,
                     Gesture::Box => base_lean + f * 0.08,
                     Gesture::Dance => base_lean + (t * 3.5).sin() * 0.15,
+                    Gesture::Balance => base_lean + (t * 7.0).sin() * 0.18 + wobble(t * 1.7, seed + 31.0) * 0.1,
+                    _ if plain_sit => base_lean + (if legs_out { -f * 0.22 * sitk } else { f * 0.08 * sitk }),
                     _ => base_lean - f * sitk * 0.05,
                 };
             }
@@ -539,8 +566,14 @@ impl Rig {
                         let creep = chest + v2(f * (5.0 + fi * 3.0) * s, s + (t * 6.0 + fi * PI).sin() * 1.5 * s);
                         target = target.lerp(creep, walking);
                     }
-                    if sitk > 0.3 {
-                        target = target.lerp(self.pose.knees[i] + v2(0.0, -s), sitk);
+                    if sitk > 0.3 && plain_sit {
+                        // Hands on knees, or planted behind it on the ground.
+                        let rest = if legs_out {
+                            v2(hip.x - f * (6.0 + fi * 2.0) * s, ground_y)
+                        } else {
+                            self.pose.knees[i] + v2(0.0, -s)
+                        };
+                        target = target.lerp(rest, sitk);
                     }
                     let mut freq = 5.5;
                     match gesture {
@@ -611,6 +644,12 @@ impl Rig {
                         Gesture::EdgeSit => {
                             target = v2(hip.x - f * (3.0 + fi * 3.0) * s, ground_y);
                             freq = 6.0;
+                        }
+                        Gesture::Balance => {
+                            // Arms out wide, windmilling.
+                            let ph = t * 9.0 + fi * PI;
+                            target = chest + v2(side * arm * 0.75 + ph.cos() * 5.0 * s, -4.0 * s + ph.sin() * 5.0 * s);
+                            freq = 9.0;
                         }
                         _ => {}
                     }

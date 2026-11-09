@@ -2,6 +2,7 @@
 //! utility AI here can later be swapped for a trained model (offline, loaded
 //! from a weights file) without touching the body or animation code.
 
+use crate::games::{GameEvent, Outcome};
 use crate::math::*;
 use crate::rig::{Gesture, WalkStyle};
 use crate::rng::Rng;
@@ -56,6 +57,8 @@ pub struct Perception {
     pub layer: Layer,
     /// Current gravity, px/s².
     pub gravity: f32,
+    /// A game you're playing right now (it's the window in front).
+    pub focus_game: Option<WinId>,
     pub allow_cursor: bool,
     pub peers: Vec<PeerView>,
 }
@@ -66,6 +69,8 @@ pub enum BrainEvent {
     Landed(f32),
     /// Got hit by another stickman.
     Hit { from: u32 },
+    /// Something happened in a game you're playing.
+    Game(GameEvent),
 }
 
 pub trait Brain {
@@ -140,6 +145,8 @@ pub struct UtilityBrain {
     grudge: Option<(u32, f32)>,
     /// An ongoing fight: (opponent, seconds left).
     fight: Option<(u32, f32)>,
+    /// A reaction to do next, whatever else it wanted (cheering a win...).
+    reaction: Option<(Kind, Intent)>,
 }
 
 impl UtilityBrain {
@@ -151,6 +158,7 @@ impl UtilityBrain {
             history: Vec::new(),
             grudge: None,
             fight: None,
+            reaction: None,
         }
     }
 
@@ -308,6 +316,21 @@ impl Brain for UtilityBrain {
                 // Hit back: fight for a while (longer if it's a grudge match).
                 self.start_fight(from, 6.0 + g * 6.0);
             }
+            BrainEvent::Game(GameEvent::Finished(_, outcome)) => {
+                let pose = |secs: f32, gesture: Gesture| Intent::Pose { secs, gesture };
+                self.reaction = Some(match outcome {
+                    // You won: celebrate.
+                    Outcome::Won => (Kind::Dance, pose(4.0, Gesture::Dance)),
+                    // You lost: sulk.
+                    Outcome::Lost => (Kind::Sit, Intent::Sit { secs: 4.0 }),
+                    Outcome::Over => (Kind::Wave, pose(1.5, Gesture::Wave)),
+                });
+                n.boredom = (n.boredom - 0.3).max(0.0);
+            }
+            BrainEvent::Game(GameEvent::Opened(..)) => {
+                // Ooh, a game: curiosity spikes (it'll want to go watch).
+                n.boredom = (n.boredom + 0.3).min(1.0);
+            }
         }
     }
 
@@ -316,9 +339,16 @@ impl Brain for UtilityBrain {
         let Some(surf) = world.surface(p.support) else {
             return Intent::Idle { secs: 0.5, fidget: Gesture::None };
         };
+        if let Some((kind, intent)) = self.reaction.take() {
+            self.commit(kind);
+            return intent;
+        }
         if let Some(intent) = self.fight_move(p, &surf, rng) {
             return intent;
         }
+        // Watching you play a game: go there, and hang around once there.
+        let watching = p.focus_game;
+        let at_game = watching.is_some() && p.support.window() == watching;
         let pers = self.personality;
         let (b, e) = (self.needs.boredom, self.needs.energy);
         // Hurt stickmen are less keen on anything energetic.
@@ -443,8 +473,10 @@ impl Brain for UtilityBrain {
                 if !world.arc_clear(p.layer, p.foot, vel, p.gravity, flight, s, &skip) {
                     continue;
                 }
+                let to_game = if watching.is_some() && t.support.window() == watching { 0.5 } else { 0.0 };
                 let score = (0.3 + b * 0.5 + pers.playfulness * 0.3 + (rise.max(0.0) / p.max_jump) * pers.curiosity * 0.2) * ef
                     - dx / (3000.0 * s)
+                    + to_game
                     + rng.f32() * 0.1;
                 if best_jump.map_or(true, |(_, bs)| score > bs) {
                     best_jump = Some((Intent::Jump { target, support: t.support }, score));
@@ -458,14 +490,16 @@ impl Brain for UtilityBrain {
         // Taskbar travel: dive into the taskbar, pop out on/in another window.
         if p.support == Support::Floor && world.portal_edge().is_some() {
             let mut best_portal: Option<(Intent, f32)> = None;
-            for w in &world.windows {
+            // Only windows that have their own button on the taskbar.
+            for w in world.windows.iter().filter(|w| world.door(w.id).is_some()) {
                 for target in [Support::Inside(w.id), Support::Window(w.id)] {
                     if world.surface(target).is_none() {
                         continue;
                     }
                     let fg = if foreground == Some(w.id) { 0.15 } else { 0.0 };
                     let room = if matches!(target, Support::Inside(_)) { pers.curiosity * 0.15 } else { 0.0 };
-                    let score = (0.15 + pers.curiosity * 0.35 + b * 0.35 + fg + room) * ef + rng.f32() * 0.15;
+                    let to_game = if watching == Some(w.id) { 0.6 } else { 0.0 };
+                    let score = (0.15 + pers.curiosity * 0.35 + b * 0.35 + fg + room) * ef + to_game + rng.f32() * 0.15;
                     if best_portal.map_or(true, |(_, bs)| score > bs) {
                         best_portal = Some((Intent::Portal { target }, score));
                     }
@@ -595,7 +629,17 @@ impl Brain for UtilityBrain {
         let mut best = (Kind::Idle, Intent::Idle { secs: 1.0, fidget: Gesture::None }, f32::MIN);
         for (kind, intent, score) in options {
             let repeats = self.history.iter().filter(|h| **h == kind).count() as i32;
-            let score = score * 0.6f32.powi(repeats) + rng.f32() * 0.3;
+            // At the game you're playing: settle in and watch.
+            let watch = if at_game {
+                match kind {
+                    Kind::Idle | Kind::Sit | Kind::EdgeSit => 0.35,
+                    Kind::Drop | Kind::Jump | Kind::Enter | Kind::Run | Kind::Layer | Kind::Climb => -0.35,
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            };
+            let score = score * 0.6f32.powi(repeats) + watch + rng.f32() * 0.3;
             if score > best.2 {
                 best = (kind, intent, score);
             }

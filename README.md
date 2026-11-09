@@ -38,9 +38,12 @@ head on window bottoms and bounces off their sides, and it only jumps when
 the arc is clear. Otherwise it goes around: climbs a window's outer wall,
 drops off edges, or dives into the taskbar and pops out on top of (or
 inside) another window. Inside a window it climbs the inner wall to get
-back out over the top. The taskbar is found with the standard appbar API,
-so this works with the stock Windows 11 taskbar and ExplorerPatcher's, on
-any edge (top-docked taskbars just skip the diving; auto-hide is detected).
+back out over the top. It only dives into the target window's own taskbar
+button, found with UI Automation, so it never jumps into the Start button
+or tray icons. This works with the stock Windows 11 taskbar and
+ExplorerPatcher's, on any edge (top-docked taskbars just skip the diving;
+auto-hide is detected). Windows are solid while walking too, and ragdolls
+bounce off them.
 
 **Walk styles.** Normal, sneaking (tiptoe, hands up), strutting, marching,
 skipping, and a tired shuffle, picked from its mood.
@@ -57,6 +60,24 @@ down on it), then pops out limp.
 **Fights.** Once two stickmen start fighting they keep at it for several
 seconds: closing in, mixing punches and kicks, backing off, guarding, and
 waiting for the other to get up.
+
+**Moving windows.** Standing or sitting on a window you drag around, it
+wobbles and windmills its arms to keep its balance. Drag it down faster
+than it can fall and it gets left behind; yank it hard and it ragdolls.
+Maximized windows count as background (nothing to climb or stand on).
+
+**Classic games.** It recognises the XP, Vista (including the Ultimate
+Extras, Texas Hold 'Em and Tinker) and Windows 7 games, including the
+win7games.com versions, by their program names. It wanders over to watch
+you play, dances when you win and sulks when you lose.
+
+**Minesweeper helper.** Every few tiles you uncover, it leaps onto a tile and
+stomps it open for you. It only picks tiles the visible numbers *prove* are
+safe, ignores your flags (a wrong one could trick it), and re-checks the
+board right before pressing, so it can't lose the game for you. Turn on
+"Let it make mistakes" (Games menu) if you'd like it to occasionally gamble.
+It reads the board from the screen; if it misreads yours, use "Save
+Minesweeper snapshot" in the Games menu and share the picture.
 
 **Gravity** can be changed from the right-click menu (Moon to Jupiter).
 Lower gravity also means higher, floatier jumps.
@@ -102,8 +123,7 @@ out, so it looks like it's behind them.
 1. ~~Procedural stickman, walking, jumping, climbing, behind-window occlusion~~
 2. Stand on things *inside* windows (message boxes, images, album covers)
    using Windows UI Automation to find their rectangles
-3. Dive into the actual taskbar button of the target window (also via UI
-   Automation) instead of wherever it's standing
+3. Stand on cards / tiles in the other classic games
 4. Pick up and carry desktop icons (behind a permission toggle)
 5. Settings/permissions panel
 6. Multi-monitor support

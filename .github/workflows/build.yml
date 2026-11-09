@@ -27,6 +27,9 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      - name: Tests
+        run: cargo test --release
+
       - name: Clippy
         run: cargo clippy --release
         continue-on-error: true

@@ -29,6 +29,9 @@ pub fn body_box(foot: Vec2, s: f32) -> Rect {
 pub struct WinInfo {
     pub id: WinId,
     pub rect: Rect,
+    /// Maximized / filling the screen: treated as background (not solid,
+    /// no top to stand on, no walls to climb).
+    pub maximized: bool,
 }
 
 /// What the stickman is standing on.
@@ -107,6 +110,40 @@ pub struct World {
     pub windows: Vec<WinInfo>,
     /// Visible (not auto-hidden) taskbar, if any.
     pub taskbar: Option<Taskbar>,
+    /// Windows that have a matching app button on the taskbar, and where
+    /// that button is: the only places it will dive into the taskbar.
+    pub doors: Vec<(WinId, Rect)>,
+}
+
+/// Does a taskbar button belong to this window? Button names are either the
+/// window title (ungrouped) or the app name, often with " - 2 running
+/// windows" tacked on. Returns a match score (0 = no).
+pub fn button_matches(button: &str, title: &str, exe: &str) -> u32 {
+    let b = button.to_lowercase();
+    // Drop "- N running window(s)" style suffixes.
+    let b: String = b.split(" - ").filter(|part| !part.contains("running window")).collect::<Vec<_>>().join(" - ");
+    let b = b.trim();
+    let t = title.to_lowercase();
+    let t = t.trim();
+    if b.is_empty() {
+        return 0;
+    }
+    if !t.is_empty() && b == t {
+        return 4;
+    }
+    // Title "Page - Google Chrome", button "Google Chrome".
+    if !t.is_empty() && (t.ends_with(b) || t.starts_with(b)) && b.len() >= 3 {
+        return 3;
+    }
+    if !t.is_empty() && (b.contains(t) || t.contains(b)) && b.len().min(t.len()) >= 4 {
+        return 2;
+    }
+    // Exe "chrome.exe" vs button "Google Chrome".
+    let stem = exe.trim_end_matches(".exe");
+    if stem.len() >= 3 && b.replace(' ', "").contains(stem) {
+        return 1;
+    }
+    0
 }
 
 impl World {
@@ -119,7 +156,12 @@ impl World {
             Layer::Front => 0,
             Layer::On(id) => self.windows.iter().position(|w| w.id == id).unwrap_or(0),
         };
-        self.windows[from..].iter().map(|w| (w.id, w.rect)).collect()
+        self.windows[from..].iter().filter(|w| !w.maximized).map(|w| (w.id, w.rect)).collect()
+    }
+
+    /// The taskbar button that leads to this window, if it has one.
+    pub fn door(&self, id: WinId) -> Option<Rect> {
+        self.doors.iter().find(|(w, _)| *w == id).map(|(_, r)| *r)
     }
 
     /// Windows the body is already overlapping (ignored for collisions, or
@@ -164,7 +206,11 @@ impl World {
                 walled: false,
             }),
             Support::Window(id) => {
-                let r = self.window(id)?.rect;
+                let w = self.window(id)?;
+                if w.maximized {
+                    return None;
+                }
+                let r = w.rect;
                 let x0 = r.l.max(self.work.l);
                 let x1 = r.r.min(self.work.r);
                 // Needs to be wide enough and leave headroom above it.
@@ -217,7 +263,11 @@ impl World {
 
     /// X coordinate of a window's side wall, if it is on screen.
     pub fn wall_x(&self, id: WinId, side: Side) -> Option<f32> {
-        let r = self.window(id)?.rect;
+        let w = self.window(id)?;
+        if w.maximized {
+            return None;
+        }
+        let r = w.rect;
         let x = match side {
             Side::Left => r.l,
             Side::Right => r.r,

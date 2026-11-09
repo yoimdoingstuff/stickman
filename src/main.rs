@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod brain;
+mod games;
 mod math;
 mod peers;
 mod platform;
@@ -16,18 +17,22 @@ mod world;
 use std::time::{Duration, Instant};
 
 use brain::{Brain, BrainEvent, PeerView, Personality, UtilityBrain};
-use math::{v2, Vec2};
+use games::minesweeper::{self, Helper, Look};
+use games::{Game, GameEvent, Watcher};
+use math::{v2, Rect, Vec2};
 use peers::Peers;
 use platform::{Event, MenuItem};
 use render::Style;
 use settings::Settings;
 use stickman::{Dims, Mode, Stickman};
-use world::World;
+use world::{button_matches, WinId, World};
 
 /// Fixed physics/animation step.
 const STEP: f32 = 1.0 / 120.0;
 /// How often to re-scan all windows (the one we're on is polled every frame).
 const WINDOW_SCAN: f32 = 0.15;
+/// How often to re-read the taskbar's buttons.
+const DOOR_SCAN: f32 = 2.0;
 /// Base size multiplier on top of the monitor's DPI scale.
 const SIZE: f32 = 1.15;
 
@@ -38,6 +43,9 @@ const MENU_COLOR: u32 = 4;
 const MENU_LIMP: u32 = 5;
 const MENU_OUTLINE: u32 = 6;
 const MENU_CURSOR: u32 = 7;
+const MENU_MS_HELP: u32 = 8;
+const MENU_MS_MISTAKES: u32 = 9;
+const MENU_MS_SNAPSHOT: u32 = 10;
 /// Gravity presets: menu ids MENU_GRAVITY + index.
 const MENU_GRAVITY: u32 = 20;
 const GRAVITY_PRESETS: [(&str, f32); 5] = [
@@ -48,6 +56,14 @@ const GRAVITY_PRESETS: [(&str, f32); 5] = [
     ("Jupiter (2.5x)", 2.5),
 ];
 const MENU_QUIT: u32 = 99;
+
+fn look_of(game: Game) -> Look {
+    if game == Game::MinesweeperXp {
+        Look::Xp
+    } else {
+        Look::Modern
+    }
+}
 
 fn main() {
     let mut plat = match platform::create() {
@@ -60,8 +76,11 @@ fn main() {
     let d = Dims::new(plat.dpi_scale() * SIZE);
     let s = d.s;
     let mut rng = rng::Rng::seeded();
-    let mut world = World { work: plat.work_area(), windows: plat.windows(), taskbar: plat.taskbar() };
+    let mut world =
+        World { work: plat.work_area(), windows: plat.windows(), taskbar: plat.taskbar(), doors: Vec::new() };
     let mut peers = Peers::new();
+    let mut watcher = Watcher::default();
+    let mut helper = Helper::new(&mut rng);
 
     let spawn = v2(world.work.l + world.work.width() * rng.range(0.2, 0.8), world.work.t + 80.0 * s);
     let mut settings = Settings::load();
@@ -79,9 +98,12 @@ fn main() {
     let mut last = Instant::now();
     let mut acc = 0.0f32;
     let mut scan = 0.0f32;
+    let mut door_scan = 0.0f32;
     let mut topmost = 0.0f32;
     let mut last_cursor = plat.cursor();
     let mut body_hit_cooldown = 0.0f32;
+    // The Minesweeper the helper is working on.
+    let mut sweeper: Option<(WinId, Look)> = None;
 
     'run: loop {
         let frame_start = Instant::now();
@@ -106,6 +128,12 @@ fn main() {
                             MenuItem::new(MENU_GRAVITY + i as u32, label, (settings.gravity - g).abs() < 0.01)
                         })
                         .collect();
+                    let game_items = vec![
+                        MenuItem::new(MENU_MS_HELP, "Help me with Minesweeper", settings.minesweeper_help),
+                        MenuItem::new(MENU_MS_MISTAKES, "Let it make mistakes", settings.minesweeper_mistakes),
+                        MenuItem::separator(),
+                        MenuItem::new(MENU_MS_SNAPSHOT, "Save Minesweeper snapshot (for bug reports)", false),
+                    ];
                     let items = [
                         MenuItem::new(MENU_LIMP, "Ragdoll", false),
                         MenuItem::new(MENU_COME, "Come here", false),
@@ -114,6 +142,7 @@ fn main() {
                         MenuItem::new(MENU_CURSOR, "Can grab my cursor", man.allow_cursor),
                         MenuItem::new(MENU_PAUSE, "Pause thinking", paused),
                         MenuItem::submenu("Gravity", gravity_items),
+                        MenuItem::submenu("Games", game_items),
                         MenuItem::separator(),
                         MenuItem::new(MENU_COLOR, "Change colour...", false),
                         MenuItem::new(MENU_OUTLINE, "Show outline", settings.outline),
@@ -149,6 +178,31 @@ fn main() {
                             style = Style::new(settings.color, settings.outline);
                             settings.save();
                         }
+                        Some(MENU_MS_HELP) => {
+                            settings.minesweeper_help = !settings.minesweeper_help;
+                            settings.save();
+                        }
+                        Some(MENU_MS_MISTAKES) => {
+                            settings.minesweeper_mistakes = !settings.minesweeper_mistakes;
+                            settings.save();
+                        }
+                        Some(MENU_MS_SNAPSHOT) => {
+                            if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
+                                let result = minesweeper::snapshot(&mut *plat, id, look_of(game));
+                                // Show the folder with the picture in it.
+                                let path = match result {
+                                    Ok(p) => Some(p),
+                                    Err(e) => {
+                                        eprintln!("stickman: {e}");
+                                        None
+                                    }
+                                };
+                                if let Some(dir) = std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("stickman")) {
+                                    let target = path.unwrap_or(dir);
+                                    let _ = std::process::Command::new("explorer").arg("/select,").arg(target).spawn();
+                                }
+                            }
+                        }
                         Some(MENU_QUIT) => break 'run,
                         Some(id) if (MENU_GRAVITY..MENU_GRAVITY + GRAVITY_PRESETS.len() as u32).contains(&id) => {
                             settings.gravity = GRAVITY_PRESETS[(id - MENU_GRAVITY) as usize].1;
@@ -167,32 +221,69 @@ fn main() {
         let dt = now.duration_since(last).as_secs_f32().min(0.1);
         last = now;
 
+        // Remember where every window was, so moves are never missed (even on
+        // the frames where the whole list is re-scanned).
+        let before: Vec<(WinId, Rect)> = world.windows.iter().map(|w| (w.id, w.rect)).collect();
         scan -= dt;
         if scan <= 0.0 {
             world.windows = plat.windows();
             world.work = plat.work_area();
             world.taskbar = plat.taskbar();
             scan = WINDOW_SCAN;
+            // Games opening, being won or lost.
+            for e in watcher.update(&*plat, &world) {
+                if matches!(e, GameEvent::Finished(..)) {
+                    man.interrupt();
+                }
+                brain.notify(BrainEvent::Game(e));
+            }
         } else {
             if let Some(id) = man.attached_window() {
                 world.set_window_rect(id, plat.window_rect(id));
             }
-            // Track the foreground window every frame: it's the one being
-            // dragged around, and it can shove or squash the stickman.
+            // The foreground window is the one being dragged around: track it
+            // every frame.
             if let Some(id) = world.windows.first().map(|w| w.id) {
-                let new = plat.window_rect(id);
-                let old = world.set_window_rect(id, new);
-                if let (Some(old), Some(new)) = (old, new) {
-                    if old != new {
-                        man.shove(&world, id, old, new, dt);
-                    }
+                world.set_window_rect(id, plat.window_rect(id));
+            }
+        }
+        // Any window that moved can shove or squash the stickman.
+        for (id, old) in before {
+            if let Some(new) = world.window(id).map(|w| w.rect) {
+                if new != old && Some(id) != man.attached_window() {
+                    man.shove(&world, id, old, new, dt);
                 }
             }
+        }
+
+        // Which taskbar button leads to which window (it only ever dives
+        // into a real app button, for the window it's heading to).
+        door_scan -= dt;
+        if door_scan <= 0.0 {
+            door_scan = DOOR_SCAN;
+            let buttons = plat.taskbar_buttons();
+            let doors: Vec<(WinId, Rect)> = world
+                .windows
+                .iter()
+                .filter_map(|w| {
+                    let title = plat.window_title(w.id);
+                    let exe = plat.window_process(w.id).map(|p| p.1).unwrap_or_default();
+                    buttons
+                        .iter()
+                        .map(|(name, r)| (button_matches(name, &title, &exe), *r))
+                        .filter(|(score, _)| *score > 0)
+                        .max_by_key(|(score, _)| *score)
+                        .map(|(_, r)| (w.id, r))
+                })
+                .collect();
+            world.doors = doors;
         }
 
         let cursor = plat.cursor();
         let cursor_vel = if dt > 0.0 { (cursor - last_cursor) / dt } else { Vec2::ZERO };
         last_cursor = cursor;
+        let foreground = plat.foreground();
+        let focus_game = foreground.filter(|id| watcher.game_window(*id).is_some());
 
         // Other stickmen: share our state, get knocked over by theirs.
         for hit in peers.update(dt, man.center(), man.vel, man.is_ragdoll()) {
@@ -211,13 +302,31 @@ fn main() {
             }
         }
 
+        // Helping with Minesweeper while you play it.
+        sweeper = None;
+        if settings.minesweeper_help && !paused {
+            if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
+                if foreground == Some(id) {
+                    let look = look_of(game);
+                    sweeper = Some((id, look));
+                    let ready = man.can_help();
+                    let mistakes = settings.minesweeper_mistakes;
+                    if let Some(at) = helper.update(dt, &mut *plat, id, look, ready, mistakes, &mut rng) {
+                        if !man.stomp(at, id) {
+                            helper.cancel();
+                        }
+                    }
+                }
+            }
+        }
+
         acc = (acc + dt).min(0.25);
         while acc >= STEP {
             acc -= STEP;
             if !paused && man.wants_intent() {
                 let views =
                     peers.list.iter().map(|p| PeerView { id: p.id, hip: p.hip, ragdoll: p.ragdoll }).collect();
-                if let Some(p) = man.perceive(cursor, views) {
+                if let Some(p) = man.perceive(cursor, views, focus_game) {
                     let intent = brain.decide(&p, &world, &mut rng);
                     man.apply(intent, &world);
                 }
@@ -232,6 +341,12 @@ fn main() {
                     if (peer.hip - man.pos).len() < range {
                         peers.send_hit(target, impulse);
                     }
+                }
+            }
+            if ev.stomped {
+                match sweeper {
+                    Some((_, look)) => helper.stomped(&mut *plat, look, &mut rng),
+                    None => helper.cancel(),
                 }
             }
         }

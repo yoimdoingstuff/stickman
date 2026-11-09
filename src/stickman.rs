@@ -82,8 +82,9 @@ pub enum Mode {
     Air,
     /// Climbing a window's side wall; `inner` = the inside of the wall.
     Climb { win: WinId, side: Side, inner: bool },
-    /// Diving through the taskbar to pop out at another window.
-    Portal { t: f32, target: Support, dir: Vec2 },
+    /// Diving into the window's taskbar button (`door`), then (once `inside`)
+    /// popping out at the window.
+    Portal { t: f32, target: Support, door: Vec2, inside: bool },
     /// Pulling up over a window's top edge. `from` is relative to the window.
     Mantle { win: WinId, side: Side, t: f32, from: Vec2 },
     /// Limp physics body (thrown, knocked over, picked up, hanging on the cursor).
@@ -100,8 +101,8 @@ enum Action {
     Pose { t: f32, gesture: Gesture },
     JumpPrep { t: f32, kind: JumpKind },
     ClimbApproach { win: WinId, side: Side, inner: bool },
-    /// Walk to `x`, then dive into the taskbar in direction `dir`.
-    PortalApproach { x: f32, dir: Vec2, target: Support },
+    /// Walk to `x`, then dive into the taskbar button at `door`.
+    PortalApproach { x: f32, door: Vec2, target: Support },
     Recover(f32),
     Punch { t: f32, target: u32, dir: f32, fired: bool },
     Kick { t: f32, target: Option<u32>, dir: f32, fired: bool },
@@ -119,6 +120,8 @@ enum JumpKind {
     Flip,
     Cartwheel,
     Cursor { secs: f32 },
+    /// Leap onto a game tile and press it with its feet.
+    Stomp { target: Vec2, game: WinId },
 }
 
 /// Things that happened during an update that the app needs to know about.
@@ -127,6 +130,8 @@ pub struct Events {
     pub landed: Option<f32>,
     /// (peer id, impulse, max distance) when a punch or kick lands.
     pub hit: Option<(u32, Vec2, f32)>,
+    /// Feet just came down on the game tile it was aiming for.
+    pub stomped: bool,
 }
 
 pub struct Stickman {
@@ -170,6 +175,15 @@ pub struct Stickman {
     room: Option<WinId>,
     /// Windows we were already overlapping when we took off (not solid).
     air_ignore: Option<Vec<WinId>>,
+    /// How fast the window we're standing on is moving, and when it last moved.
+    support_vel: Vec2,
+    last_carry_t: f32,
+    /// Seconds left of wobbling to keep balance.
+    wobble: f32,
+    /// Mid-leap onto a game tile (its top, and the game window).
+    stomp_target: Option<(Vec2, WinId)>,
+    /// Flying without bumping into windows (heroic leaps to help in games).
+    ghost: bool,
     pub rig: Rig,
 }
 
@@ -238,6 +252,11 @@ impl Stickman {
             last_rag_vel: Vec2::ZERO,
             room: None,
             air_ignore: None,
+            support_vel: Vec2::ZERO,
+            last_carry_t: 0.0,
+            wobble: 0.0,
+            stomp_target: None,
+            ghost: false,
             rig: Rig::new(),
         }
     }
@@ -272,7 +291,7 @@ impl Stickman {
         matches!(self.mode, Mode::Ground(_)) && self.action.is_none()
     }
 
-    pub fn perceive(&self, cursor: Vec2, peers: Vec<PeerView>) -> Option<Perception> {
+    pub fn perceive(&self, cursor: Vec2, peers: Vec<PeerView>, focus_game: Option<WinId>) -> Option<Perception> {
         match self.mode {
             Mode::Ground(support) => Some(Perception {
                 hip: self.pos,
@@ -283,6 +302,7 @@ impl Stickman {
                 health: self.health,
                 layer: self.layer,
                 gravity: self.g(),
+                focus_game,
                 reach: self.d.reach() + self.d.stance,
                 cursor,
                 allow_cursor: self.allow_cursor,
@@ -303,13 +323,46 @@ impl Stickman {
         }
     }
 
+    /// Free to go and help with a game right now?
+    pub fn can_help(&self) -> bool {
+        matches!(self.mode, Mode::Ground(_))
+            && self.health >= HURT
+            && !matches!(
+                self.action,
+                Some(Action::JumpPrep { .. })
+                    | Some(Action::ClimbApproach { .. })
+                    | Some(Action::PortalApproach { .. })
+                    | Some(Action::Punch { .. })
+                    | Some(Action::Kick { .. })
+            )
+    }
+
+    /// Leap onto a game tile at `target` (its top surface) to press it.
+    pub fn stomp(&mut self, target: Vec2, game: WinId) -> bool {
+        if !self.can_help() {
+            return false;
+        }
+        if (target.x - self.pos.x).abs() > 1.0 {
+            self.facing = (target.x - self.pos.x).signum();
+        }
+        self.action = Some(Action::JumpPrep { t: 0.15, kind: JumpKind::Stomp { target, game } });
+        true
+    }
+
+    /// Drop whatever it's doing (so it can react to something right away).
+    pub fn interrupt(&mut self) {
+        if matches!(self.mode, Mode::Ground(_)) && !matches!(self.action, Some(Action::JumpPrep { .. })) {
+            self.action = None;
+        }
+    }
+
     pub fn in_portal(&self) -> bool {
         matches!(self.mode, Mode::Portal { .. })
     }
 
     /// Fully inside the taskbar, between leaving and arriving.
     pub fn hidden(&self) -> bool {
-        matches!(self.mode, Mode::Portal { t, .. } if t >= 0.45)
+        matches!(self.mode, Mode::Portal { inside: true, .. })
     }
 
     pub fn is_resting(&self) -> bool {
@@ -355,7 +408,7 @@ impl Stickman {
         match self.squash {
             // Flattened against the edge/floor like a cartoon pancake.
             Some(sq) => {
-                let k = if sq.t < 0.08 { 1.0 - (sq.t / 0.08) * 0.8 } else { 0.2 + (sq.t * 30.0).sin() * 0.02 };
+                let k = if sq.t < 0.06 { 1.0 - (sq.t / 0.06) * 0.75 } else { 0.25 + (sq.t * 40.0).sin() * 0.03 };
                 if sq.horizontal {
                     map_pose(&p, |v| v2(sq.line + (v.x - sq.line) * k, v.y))
                 } else {
@@ -383,6 +436,7 @@ impl Stickman {
             r.room = None;
             let i = r.nearest(cursor);
             r.pin(i, cursor, Vec2::ZERO);
+            r.set_held(true);
             self.user_pin = Some(i);
         }
     }
@@ -395,6 +449,7 @@ impl Stickman {
         let gentle = match &mut self.ragdoll {
             Some(r) => {
                 r.clear_pins();
+                r.set_held(false);
                 let v = r.velocity();
                 let max = 2600.0 * self.d.s;
                 if v.len() > max {
@@ -456,8 +511,11 @@ impl Stickman {
         let w = world.work;
         let v_overlap = new.t < bottom && new.b > top;
         let h_overlap = new.l < c.x + half && new.r > c.x - half;
+        let old_mid = (old.l + old.r) * 0.5;
 
-        if v_overlap && new.r > old.r && old.r <= c.x - half + 2.0 && new.r > c.x - half {
+        // Which side of the window we're on decides which way we get pushed,
+        // so even a fast drag that jumps right past us in one frame counts.
+        if v_overlap && new.r > old.r && c.x >= old_mid && old.r <= c.x + half && new.r > c.x - half {
             // Right edge sweeping right into us.
             let target = new.r + half;
             if target > w.r - half {
@@ -465,7 +523,7 @@ impl Stickman {
             } else {
                 self.push_x(target - c.x, (new.r - old.r) / dt);
             }
-        } else if v_overlap && new.l < old.l && old.l >= c.x + half - 2.0 && new.l < c.x + half {
+        } else if v_overlap && new.l < old.l && c.x <= old_mid && old.l >= c.x - half && new.l < c.x + half {
             // Left edge sweeping left into us.
             let target = new.l - half;
             if target < w.l + half {
@@ -584,15 +642,18 @@ impl Stickman {
             }
             Intent::Climb { win, side, inner } => Action::ClimbApproach { win, side, inner },
             Intent::Portal { target } => {
+                // Only through the window's own taskbar button.
                 let s = self.d.s;
-                let floor = world.surface(Support::Floor);
-                match (world.portal_edge(), floor) {
-                    (Some(Edge::Bottom), _) => Action::PortalApproach { x: self.pos.x, dir: v2(0.0, 1.0), target },
-                    (Some(Edge::Left), Some(f)) => {
-                        Action::PortalApproach { x: f.x0 + 6.0 * s, dir: v2(-1.0, 0.0), target }
-                    }
-                    (Some(Edge::Right), Some(f)) => {
-                        Action::PortalApproach { x: f.x1 - 6.0 * s, dir: v2(1.0, 0.0), target }
+                let door = target.window().and_then(|id| world.door(id));
+                match (world.portal_edge(), world.surface(Support::Floor), door) {
+                    (Some(edge), Some(f), Some(d)) => {
+                        let door = v2((d.l + d.r) * 0.5, (d.t + d.b) * 0.5);
+                        let x = match edge {
+                            Edge::Left => f.x0 + 6.0 * s,
+                            Edge::Right => f.x1 - 6.0 * s,
+                            _ => door.x.clamp(f.x0 + 6.0 * s, f.x1 - 6.0 * s),
+                        };
+                        Action::PortalApproach { x, door, target }
                     }
                     _ => idle(0.5),
                 }
@@ -629,13 +690,14 @@ impl Stickman {
         // Squashed flat: hold it for a moment, then pop out limp.
         if let Some(mut sq) = self.squash {
             sq.t += dt;
-            if sq.t < 1.3 {
+            // Just a quick flattening, then straight into ragdoll.
+            if sq.t < 0.25 {
                 self.squash = Some(sq);
                 return ev;
             }
             self.squash = None;
             let s = self.d.s;
-            let pop = (if sq.horizontal { v2(sq.dir * 350.0, -300.0) } else { v2(self.facing * 120.0, -450.0) }) * s;
+            let pop = (if sq.horizontal { v2(sq.dir * 500.0, -350.0) } else { v2(self.facing * 150.0, -500.0) }) * s;
             match &mut self.ragdoll {
                 Some(r) => r.add_velocity(pop),
                 None => self.start_ragdoll(pop),
@@ -646,22 +708,30 @@ impl Stickman {
         let state = match mode {
             Mode::Ground(support) => self.update_ground(dt, world, support, &mut ev),
             Mode::Air => {
-                ev.landed = self.update_air(dt, world);
+                ev.landed = self.update_air(dt, world, &mut ev.stomped);
                 RigState::Air
             }
             Mode::Climb { win, side, inner } => self.update_climb(dt, world, win, side, inner),
             Mode::Mantle { win, side, t, from } => self.update_mantle(dt, world, win, side, t, from),
-            Mode::Portal { t, target, dir } => {
+            Mode::Portal { t, target, door, inside } => {
                 let t = t + dt;
-                if t < 0.45 {
-                    // Diving into the taskbar (the taskbar covers us as we go in).
-                    self.vel = dir * 260.0 * self.d.s;
-                    self.pos += self.vel * dt;
-                }
-                if t >= 0.85 {
+                if !inside {
+                    // Leap into the button (the taskbar covers us as we go in).
+                    let to = door - self.pos;
+                    let dist = to.len();
+                    let speed = 320.0 * self.d.s;
+                    self.vel = if dist > 1e-3 { to * (speed / dist) } else { Vec2::ZERO };
+                    if dist <= speed * dt || t > 1.5 {
+                        self.pos = door;
+                        self.mode = Mode::Portal { t: 0.0, target, door, inside: true };
+                    } else {
+                        self.pos += self.vel * dt;
+                        self.mode = Mode::Portal { t, target, door, inside: false };
+                    }
+                } else if t >= 0.4 {
                     self.exit_portal(world, target);
                 } else {
-                    self.mode = Mode::Portal { t, target, dir };
+                    self.mode = Mode::Portal { t, target, door, inside: true };
                 }
                 RigState::Air
             }
@@ -726,6 +796,8 @@ impl Stickman {
     }
 
     fn reset_air_state(&mut self) {
+        self.stomp_target = None;
+        self.ghost = false;
         self.air_ignore = None;
         self.anchor = None;
         self.pending_climb = None;
@@ -876,6 +948,56 @@ impl Stickman {
         self.anchor = now;
     }
 
+    /// Standing on a window that's being dragged: feel how hard it's moving.
+    /// Returns false if we lost our footing (now falling or ragdolling).
+    fn ride(&mut self, world: &World, win: WinId) -> bool {
+        let s = self.d.s;
+        let Some(o) = window_origin(world, win) else { return true };
+        let Some((prev_id, prev)) = self.anchor else {
+            self.support_vel = Vec2::ZERO;
+            self.last_carry_t = self.time;
+            self.anchor = Some((win, o));
+            return true;
+        };
+        let delta = o - prev;
+        if prev_id != win || delta == Vec2::ZERO {
+            // Window stopped: forget its speed after a moment.
+            if self.time - self.last_carry_t > 0.08 {
+                self.support_vel = Vec2::ZERO;
+            }
+            self.carry(world, Some(win));
+            return true;
+        }
+        let elapsed = (self.time - self.last_carry_t).clamp(1.0 / 240.0, 0.1);
+        // Smoothed, so mouse jitter while dragging doesn't count as a jolt.
+        let before = self.support_vel;
+        let vel = before.lerp(delta / elapsed, 0.5);
+        self.support_vel = vel;
+        self.last_carry_t = self.time;
+
+        // Pulled down faster than it can fall: it gets left behind. Yanked
+        // sideways (or anywhere) really hard: knocked off its feet.
+        let violent = vel.len() > 2800.0 * s || vel.x.abs() > 2000.0 * s;
+        let dropped = vel.y > 1100.0 * s;
+        if violent || dropped {
+            self.anchor = None;
+            if violent {
+                // Keeps its own momentum while the window flies away.
+                self.start_ragdoll(before * 0.3 + v2(0.0, -150.0 * s));
+            } else {
+                self.start_fall();
+                self.vel = v2(before.x * 0.5, before.y.min(250.0 * s));
+            }
+            return false;
+        }
+        if (vel - before).len() > 150.0 * s || vel.len() > 500.0 * s {
+            // Wobbly: arms out, trying to stay on.
+            self.wobble = self.wobble.max(0.8);
+        }
+        self.carry(world, Some(win));
+        true
+    }
+
     fn start_fall(&mut self) {
         self.mode = Mode::Air;
         self.reset_air_state();
@@ -888,7 +1010,14 @@ impl Stickman {
             self.start_fall();
             return RigState::Air;
         };
-        self.carry(world, support.window());
+        match support.window() {
+            Some(win) => {
+                if !self.ride(world, win) {
+                    return RigState::Air;
+                }
+            }
+            None => self.carry(world, None),
+        }
         if let (Support::Inside(id), false) = (support, self.force_front) {
             self.layer = Layer::On(id);
         }
@@ -896,6 +1025,7 @@ impl Stickman {
         let mut desired = 0.0;
         let mut sit = false;
         let mut gesture = Gesture::None;
+        self.wobble = (self.wobble - dt).max(0.0);
         let mut style = self.walk_style(WalkStyle::Normal);
         self.room = match support {
             Support::Inside(id) => Some(id),
@@ -903,13 +1033,13 @@ impl Stickman {
         };
         if let Some(action) = self.action {
             let next = match action {
-                Action::PortalApproach { x, dir, target } => {
+                Action::PortalApproach { x, door, target } => {
                     let dx = x - self.pos.x;
                     if dx.abs() > 2.5 * s {
                         desired = dx.signum() * 120.0 * s;
                         Some(action)
                     } else {
-                        self.mode = Mode::Portal { t: 0.0, target, dir };
+                        self.mode = Mode::Portal { t: 0.0, target, door, inside: false };
                         self.action = None;
                         self.reset_air_state();
                         self.room = None;
@@ -1050,12 +1180,33 @@ impl Stickman {
 
         let accel = if desired.abs() > self.vel.x.abs() { 1300.0 } else { 2200.0 } * s;
         self.vel.x = approach(self.vel.x, desired, accel * dt);
+        let old_x = self.pos.x;
         self.pos.x += self.vel.x * dt;
         if desired.abs() > 1.0 && !matches!(self.action, Some(Action::Punch { .. }) | Some(Action::Kick { .. })) {
             self.facing = desired.signum();
         }
         self.pos.y = surf.y - d.stance;
         self.vel.y = 0.0;
+
+        // Windows in our layer are walls: stop at their side instead of
+        // walking through (it can climb them instead). Windows we're already
+        // overlapping (e.g. one reaching down to the floor we started inside)
+        // don't block, so it can never get stuck.
+        if !surf.walled && self.pos.x != old_x {
+            let nb = body_box(v2(self.pos.x, surf.y - 1.0), s);
+            let pb = body_box(v2(old_x, surf.y - 1.0), s);
+            for (id, r) in world.solids(self.layer) {
+                if Some(id) == support.window() || !r.overlaps(&nb) || r.overlaps(&pb) {
+                    continue;
+                }
+                self.pos.x = if old_x < r.l { r.l - 5.5 * s } else { r.r + 5.5 * s };
+                self.vel.x = 0.0;
+                if matches!(self.action, Some(Action::Walk { .. })) {
+                    self.action = None;
+                }
+                break;
+            }
+        }
 
         let (lim0, lim1) = if surf.walled {
             (surf.x0 + 4.0 * s, surf.x1 - 4.0 * s)
@@ -1076,6 +1227,8 @@ impl Stickman {
         // Sitting / lying poses take priority over crawling.
         if sit || gesture.is_low() {
             style = WalkStyle::Normal;
+        } else if self.wobble > 0.0 && !matches!(gesture, Gesture::Punch(_) | Gesture::Kick(_)) {
+            gesture = Gesture::Balance;
         }
         RigState::Stand { ground_y: surf.y, sit, gesture, style }
     }
@@ -1099,6 +1252,15 @@ impl Stickman {
                 self.spin_rate = -self.facing * TAU / flight;
                 // Land back where we took off, even inside a window.
                 self.jump_target = from;
+            }
+            JumpKind::Stomp { target, game } => {
+                self.launch(target, 45.0 * s);
+                self.stomp_target = Some((target, game));
+                self.ghost = true;
+                if !self.force_front {
+                    self.layer = Layer::On(game);
+                }
+                self.room = None;
             }
             JumpKind::Cartwheel => {
                 let mut target = foot + v2(self.facing * 80.0 * s, 0.0);
@@ -1213,14 +1375,52 @@ impl Stickman {
         }
     }
 
-    fn update_air(&mut self, dt: f32, world: &World) -> Option<f32> {
+    fn update_air(&mut self, dt: f32, world: &World, stomped: &mut bool) -> Option<f32> {
         let d = self.d;
         let s = d.s;
         let prev_foot = self.pos.y + d.stance;
         let prev_pos = self.pos;
         self.vel.y += self.g() * dt;
         self.pos += self.vel * dt;
-        self.collide_windows(world, prev_pos);
+        if !self.ghost {
+            self.collide_windows(world, prev_pos);
+        }
+
+        // Coming down on a game tile: press it with its feet and bounce off,
+        // then drop into the game window.
+        if let Some((target, game)) = self.stomp_target {
+            let foot = self.pos.y + d.stance;
+            if self.vel.y > 0.0 && foot >= target.y && (self.pos.x - target.x).abs() < 16.0 * s {
+                *stomped = true;
+                self.pos.y = target.y - d.stance;
+                self.vel = v2(-self.facing * 60.0 * s, -380.0 * s);
+                self.rig.on_land(500.0 * s);
+                self.stomp_target = None;
+                self.ghost = false;
+                self.air_ignore = Some(vec![game]);
+                if world.surface(Support::Inside(game)).is_some() {
+                    self.room = Some(game);
+                    self.jump_target = Some(Support::Inside(game));
+                }
+                return None;
+            }
+            if foot > target.y + 60.0 * s {
+                // Missed.
+                self.stomp_target = None;
+                self.ghost = false;
+            } else {
+                // Don't land on window tops on the way down to the tile.
+                let floor = world.work.b;
+                if foot >= floor {
+                    if let Some(f) = world.surface(Support::Floor) {
+                        let impact = self.vel.y;
+                        self.land(f, world);
+                        return Some(impact);
+                    }
+                }
+                return None;
+            }
+        }
         if self.spin_rate != 0.0 {
             self.spin = (self.spin + self.spin_rate * dt).clamp(-TAU, TAU);
         }
