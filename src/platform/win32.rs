@@ -1,103 +1,143 @@
-//! Windows backend: a small per-pixel-alpha layered window that follows the
-//! stickman around, plus window enumeration for z-order and surfaces.
+//! Windows backend: one small per-pixel-alpha layered window per stickman
+//! that follows it around, a hidden window for the tray icon and menus,
+//! plus window enumeration for z-order and surfaces.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{BitBlt, ClientToScreen, ScreenToClient, SRCCOPY};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows_sys::Win32::Graphics::Gdi::{
+    BitBlt, ClientToScreen, CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
+    EnumDisplayMonitors, GetDC, GetMonitorInfoW, GetStockObject, ReleaseDC, ScreenToClient, SelectObject, AC_SRC_ALPHA,
+    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR,
+    MONITORINFO, SRCCOPY,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsZoomed,
-    SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEMOVE,
-};
-use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, HMONITOR, MONITORINFO};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CallNextHookEx, DestroyWindow, FindWindowExW, SendMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
-};
-use windows_sys::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-};
-use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC,
-};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
-};
+use windows_sys::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
 use windows_sys::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::Shell::{
-    SHAppBarMessage, ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA,
+    SHAppBarMessage, Shell_NotifyIconW, ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    EnumWindows, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, GWL_EXSTYLE,
-    HMENU, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    PM_REMOVE,
-    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AdjustWindowRect, AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW, FindWindowW,
+    GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    LoadCursorW, MessageBoxW, PeekMessageW, PostMessageW, RegisterClassW, RegisterWindowMessageW, SendMessageW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, GWL_EXSTYLE, HICON, HMENU,
+    HWND_TOPMOST, ICONINFO, IDC_ARROW, IDYES, MA_NOACTIVATE, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SPI_GETWORKAREA, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+    WM_APP, WM_CLOSE, WM_ENDSESSION, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NULL,
+    WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use super::uia::{Element, PageBoxes, Reply, Request, Worker};
-use super::{Event, Image, MenuItem, Platform, SettingItem};
+use super::{Event, Image, MenuItem, PageSnapshot, Platform, SettingItem};
 use crate::math::{v2, Rect, Vec2};
 use crate::world::{Edge, Taskbar, WinId, WinInfo};
 
 thread_local! {
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
+    /// Which overlay window is which stickman: (window handle, slot).
+    static SLOTS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+    /// Explorer restarted: the tray icon needs adding again.
+    static TRAY_LOST: Cell<bool> = const { Cell::new(false) };
+    /// The "TaskbarCreated" message Explorer broadcasts when it restarts.
+    static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
 }
 
 fn push_event(e: Event) {
     EVENTS.with(|q| q.borrow_mut().push(e));
 }
 
+fn slot_of(hwnd: HWND) -> Option<usize> {
+    SLOTS.with(|s| s.borrow().iter().find(|(h, _)| *h == hwnd as usize).map(|(_, slot)| *slot))
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+const OVERLAY_CLASS: &str = "StickmanOverlay";
+const HOST_CLASS: &str = "StickmanHost";
+/// Tray icon clicks arrive as this message.
+const TRAY_MSG: u32 = WM_APP + 1;
+
+/// A stickman's overlay window.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         // Clicking the stickman must never steal focus from your apps.
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
-            SetCapture(hwnd);
-            push_event(Event::MouseDown);
+            if let Some(slot) = slot_of(hwnd) {
+                SetCapture(hwnd);
+                push_event(Event::MouseDown { slot });
+            }
             0
         }
         WM_LBUTTONUP => {
             ReleaseCapture();
-            push_event(Event::MouseUp);
+            if let Some(slot) = slot_of(hwnd) {
+                push_event(Event::MouseUp { slot });
+            }
             0
         }
         WM_RBUTTONUP => {
-            push_event(Event::RightClick);
+            if let Some(slot) = slot_of(hwnd) {
+                push_event(Event::RightClick { slot });
+            }
+            0
+        }
+        // Overlays only go away when the program removes them.
+        WM_CLOSE => 0,
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// The hidden window that owns the tray icon and the menus.
+unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        TRAY_MSG => {
+            let what = (lp as usize & 0xFFFF) as u32;
+            if what == WM_LBUTTONUP || what == WM_RBUTTONUP {
+                push_event(Event::Tray);
+            }
+            0
+        }
+        // Windows is shutting down / logging off: save everyone first.
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION => {
+            if wp != 0 {
+                push_event(Event::Quit);
+            }
             0
         }
         WM_CLOSE => {
             push_event(Event::Quit);
             0
         }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
+        _ => {
+            if msg != 0 && msg == TASKBAR_CREATED.with(|c| c.get()) {
+                TRAY_LOST.with(|c| c.set(true));
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
@@ -119,19 +159,7 @@ const DEFAULT_GUI_FONT: i32 = 17;
 /// COLOR_BTNFACE + 1: the usual dialog background.
 const DIALOG_BRUSH: usize = 16;
 
-const MSG_MOUSEWHEEL: usize = 0x020A;
 const LVM_SETITEMPOSITION: u32 = 0x100F;
-
-/// Low-level mouse hook: only looks at the wheel (so the stickman can react
-/// the instant you scroll a web page). Everything is passed straight on.
-unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if code >= 0 && wp == MSG_MOUSEWHEEL {
-        let info = &*(lp as *const MSLLHOOKSTRUCT);
-        let delta = ((info.mouseData >> 16) & 0xFFFF) as u16 as i16;
-        push_event(Event::Wheel { at: v2(info.pt.x as f32, info.pt.y as f32), notches: delta as f32 / 120.0 });
-    }
-    CallNextHookEx(null_mut(), code, wp, lp)
-}
 
 unsafe extern "system" fn collect_monitor(mon: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
     let list = &mut *(data as *mut Vec<(Rect, bool)>);
@@ -226,7 +254,47 @@ unsafe fn frame_rect(h: HWND) -> Option<Rect> {
     })
 }
 
-pub struct Win32Platform {
+/// A tray icon from a square straight-alpha RGBA image.
+unsafe fn make_icon(rgba: &[u8], size: u32) -> HICON {
+    if rgba.len() < (size * size * 4) as usize || size == 0 {
+        return null_mut();
+    }
+    let mut bmi: BITMAPINFO = zeroed();
+    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = size as i32;
+    bmi.bmiHeader.biHeight = -(size as i32);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    let screen = GetDC(null_mut());
+    let mut bits: *mut c_void = null_mut();
+    let color = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    ReleaseDC(null_mut(), screen);
+    if color.is_null() || bits.is_null() {
+        return null_mut();
+    }
+    let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
+    for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        d[0] = s[2];
+        d[1] = s[1];
+        d[2] = s[0];
+        d[3] = s[3];
+    }
+    // The mask is ignored for icons with alpha, but must exist.
+    let row = (size as usize).div_ceil(16) * 2;
+    let zeros = vec![0u8; row * size as usize];
+    let mask = CreateBitmap(size as i32, size as i32, 1, 1, zeros.as_ptr() as *const c_void);
+    let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+    let icon = CreateIconIndirect(&info);
+    DeleteObject(color);
+    if !mask.is_null() {
+        DeleteObject(mask);
+    }
+    icon
+}
+
+/// One stickman's window and its drawing buffer.
+struct Overlay {
     hwnd: HWND,
     mem_dc: HDC,
     bitmap: HBITMAP,
@@ -234,6 +302,42 @@ pub struct Win32Platform {
     w: u32,
     h: u32,
     shown: bool,
+}
+
+impl Overlay {
+    unsafe fn resize_buffer(&mut self, w: u32, h: u32) {
+        let mut bmi: BITMAPINFO = zeroed();
+        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w as i32;
+        bmi.bmiHeader.biHeight = -(h as i32); // top-down rows
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut bits: *mut c_void = null_mut();
+        let bmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        SelectObject(self.mem_dc, bmp);
+        if !self.bitmap.is_null() {
+            DeleteObject(self.bitmap);
+        }
+        self.bitmap = bmp;
+        self.bits = bits as *mut u8;
+        self.w = w;
+        self.h = h;
+    }
+
+    unsafe fn destroy(self) {
+        DestroyWindow(self.hwnd);
+        if !self.bitmap.is_null() {
+            DeleteObject(self.bitmap);
+        }
+        DeleteDC(self.mem_dc);
+    }
+}
+
+pub struct Win32Platform {
+    /// Hidden window: owns the tray icon and the menus.
+    host: HWND,
+    overlays: Vec<Option<Overlay>>,
     /// The 16 "custom colours" slots in the picker, kept for the session.
     custom_colors: [u32; 16],
     /// UI Automation background thread, started the first time it's needed,
@@ -243,10 +347,15 @@ pub struct Win32Platform {
     icons: Vec<(String, Rect)>,
     settings_hwnd: HWND,
     settings_class: bool,
-    wheel_hook: HHOOK,
+    tray_icon: HICON,
+    tray_added: bool,
+    /// What the tray icon shows, to put it back if Explorer restarts.
+    tray_image: Option<(Vec<u8>, u32, String)>,
     buttons: Vec<(String, Rect)>,
-    elements: Vec<(usize, Vec<Element>, std::time::Instant)>,
-    pages: Vec<(usize, Option<PageBoxes>, std::time::Instant)>,
+    elements: Vec<(usize, Vec<Element>, Instant)>,
+    pages: Vec<(usize, Option<PageBoxes>, Instant, Option<(u32, f32)>)>,
+    /// Latest position of each followed page box: (window, tracking, top, when).
+    probes: Vec<(usize, u32, f32, Instant)>,
 }
 
 impl Win32Platform {
@@ -256,25 +365,30 @@ impl Win32Platform {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
             let hinst = GetModuleHandleW(null());
-            let class = wide("StickmanOverlay");
-            let wc = WNDCLASSW {
-                style: 0,
-                lpfnWndProc: Some(wndproc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinst,
-                hIcon: null_mut(),
-                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-                hbrBackground: null_mut(),
-                lpszMenuName: null(),
-                lpszClassName: class.as_ptr(),
-            };
-            if RegisterClassW(&wc) == 0 {
-                return Err("RegisterClassW failed".into());
+            type Proc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+            let classes: [(&str, Proc); 2] = [(OVERLAY_CLASS, wndproc as Proc), (HOST_CLASS, host_proc as Proc)];
+            for (name, proc_) in classes {
+                let class = wide(name);
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(proc_),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: hinst,
+                    hIcon: null_mut(),
+                    hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                    hbrBackground: null_mut(),
+                    lpszMenuName: null(),
+                    lpszClassName: class.as_ptr(),
+                };
+                if RegisterClassW(&wc) == 0 {
+                    return Err("RegisterClassW failed".into());
+                }
             }
+            let class = wide(HOST_CLASS);
             let title = wide("Stickman");
-            let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            let host = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
                 class.as_ptr(),
                 title.as_ptr(),
                 WS_POPUP,
@@ -287,33 +401,27 @@ impl Win32Platform {
                 hinst,
                 null(),
             );
-            if hwnd.is_null() {
+            if host.is_null() {
                 return Err("CreateWindowExW failed".into());
             }
-            // Keep the stickman out of screen captures (so reading a game
-            // board isn't confused by the stickman standing on it).
-            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-            let screen = GetDC(null_mut());
-            let mem_dc = CreateCompatibleDC(screen);
-            ReleaseDC(null_mut(), screen);
+            let created = wide("TaskbarCreated");
+            TASKBAR_CREATED.with(|c| c.set(RegisterWindowMessageW(created.as_ptr())));
             Ok(Win32Platform {
-                hwnd,
-                mem_dc,
-                bitmap: null_mut(),
-                bits: null_mut(),
-                w: 0,
-                h: 0,
-                shown: false,
+                host,
+                overlays: Vec::new(),
                 custom_colors: [0x00FF_FFFF; 16],
                 uia: None,
                 uia_failed: false,
                 buttons: Vec::new(),
                 elements: Vec::new(),
                 pages: Vec::new(),
+                probes: Vec::new(),
                 icons: Vec::new(),
                 settings_hwnd: null_mut(),
                 settings_class: false,
-                wheel_hook: SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0),
+                tray_icon: null_mut(),
+                tray_added: false,
+                tray_image: None,
             })
         }
     }
@@ -337,13 +445,18 @@ impl Win32Platform {
                         self.elements.remove(0);
                     }
                 }
-                Reply::Page(h, p, t) => {
-                    self.pages.retain(|(k, _, _)| *k != h);
-                    self.pages.push((h, p, t));
+                Reply::Page(h, p, t, probe) => {
+                    self.pages.retain(|(k, _, _, _)| *k != h);
+                    self.pages.push((h, p, t, probe));
                     if self.pages.len() > 4 {
                         self.pages.remove(0);
                     }
                 }
+                Reply::Probe(h, tracking, top, at) => {
+                    self.probes.retain(|(k, _, _, _)| *k != h);
+                    self.probes.push((h, tracking, top, at));
+                }
+                Reply::ProbeLost(h) => self.probes.retain(|(k, _, _, _)| *k != h),
                 Reply::InvokeFailed(h, at) => clicks.push((h, at)),
                 Reply::Icons(icons) => self.icons = icons,
             }
@@ -355,30 +468,11 @@ impl Win32Platform {
         self.uia.as_mut()
     }
 
-    unsafe fn resize_buffer(&mut self, w: u32, h: u32) {
-        let mut bmi: BITMAPINFO = zeroed();
-        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = w as i32;
-        bmi.bmiHeader.biHeight = -(h as i32); // top-down rows
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut c_void = null_mut();
-        let bmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        SelectObject(self.mem_dc, bmp);
-        if !self.bitmap.is_null() {
-            DeleteObject(self.bitmap);
-        }
-        self.bitmap = bmp;
-        self.bits = bits as *mut u8;
-        self.w = w;
-        self.h = h;
-    }
-
     unsafe fn describe(&self, h: HWND) -> Option<WinInfo> {
-        if h == self.hwnd || IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
+        if IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
             return None;
         }
+        // (The stickmen's own windows are tool windows, so they're skipped here.)
         let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
         if ex & WS_EX_TOOLWINDOW != 0 {
             return None;
@@ -426,6 +520,13 @@ impl Platform for Win32Platform {
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+        }
+        // Explorer restarted: put the tray icon back.
+        if TRAY_LOST.with(|c| c.replace(false)) {
+            self.tray_added = false;
+            if let Some((rgba, size, tip)) = self.tray_image.clone() {
+                self.set_tray(&rgba, size, &tip);
             }
         }
         EVENTS.with(|q| std::mem::take(&mut *q.borrow_mut()))
@@ -499,7 +600,7 @@ impl Platform for Win32Platform {
     }
 
     fn dpi_scale(&self) -> f32 {
-        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        let dpi = unsafe { GetDpiForSystem() };
         if dpi == 0 {
             1.0
         } else {
@@ -507,15 +608,59 @@ impl Platform for Win32Platform {
         }
     }
 
-    fn present(&mut self, rgba: &[u8], w: u32, h: u32, x: i32, y: i32, occluders: &[Rect]) {
+    fn create_overlay(&mut self) -> usize {
+        let slot = self.overlays.iter().position(Option::is_none).unwrap_or(self.overlays.len());
+        if slot == self.overlays.len() {
+            self.overlays.push(None);
+        }
         unsafe {
-            if w != self.w || h != self.h || self.bits.is_null() {
-                self.resize_buffer(w, h);
-                if self.bits.is_null() {
+            let hinst = GetModuleHandleW(null());
+            let class = wide(OVERLAY_CLASS);
+            let title = wide("Stickman");
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                null_mut(),
+                null_mut(),
+                hinst,
+                null(),
+            );
+            if hwnd.is_null() {
+                return slot;
+            }
+            let screen = GetDC(null_mut());
+            let mem_dc = CreateCompatibleDC(screen);
+            ReleaseDC(null_mut(), screen);
+            SLOTS.with(|s| s.borrow_mut().push((hwnd as usize, slot)));
+            self.overlays[slot] =
+                Some(Overlay { hwnd, mem_dc, bitmap: null_mut(), bits: null_mut(), w: 0, h: 0, shown: false });
+        }
+        slot
+    }
+
+    fn destroy_overlay(&mut self, slot: usize) {
+        if let Some(o) = self.overlays.get_mut(slot).and_then(Option::take) {
+            SLOTS.with(|s| s.borrow_mut().retain(|(h, _)| *h != o.hwnd as usize));
+            unsafe { o.destroy() };
+        }
+    }
+
+    fn present(&mut self, slot: usize, rgba: &[u8], w: u32, h: u32, x: i32, y: i32, occluders: &[Rect]) {
+        let Some(Some(o)) = self.overlays.get_mut(slot) else { return };
+        unsafe {
+            if w != o.w || h != o.h || o.bits.is_null() {
+                o.resize_buffer(w, h);
+                if o.bits.is_null() {
                     return;
                 }
             }
-            let dst = std::slice::from_raw_parts_mut(self.bits, (w * h * 4) as usize);
+            let dst = std::slice::from_raw_parts_mut(o.bits, (w * h * 4) as usize);
             // tiny-skia is premultiplied RGBA; GDI wants premultiplied BGRA.
             for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
                 d[0] = s[2];
@@ -549,14 +694,48 @@ impl Platform for Win32Platform {
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let screen = GetDC(null_mut());
-            UpdateLayeredWindow(
-                self.hwnd, screen, &pt_dst, &size, self.mem_dc, &pt_src, 0, &blend, ULW_ALPHA,
-            );
+            UpdateLayeredWindow(o.hwnd, screen, &pt_dst, &size, o.mem_dc, &pt_src, 0, &blend, ULW_ALPHA);
             ReleaseDC(null_mut(), screen);
-            if !self.shown {
-                ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                self.shown = true;
+            if !o.shown {
+                ShowWindow(o.hwnd, SW_SHOWNOACTIVATE);
+                o.shown = true;
             }
+        }
+    }
+
+    fn set_tray(&mut self, rgba: &[u8], size: u32, tip: &str) {
+        unsafe {
+            let icon = make_icon(rgba, size);
+            if icon.is_null() {
+                return;
+            }
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.host;
+            nid.uID = 1;
+            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            nid.uCallbackMessage = TRAY_MSG;
+            nid.hIcon = icon;
+            let text: Vec<u16> = tip.encode_utf16().take(nid.szTip.len() - 1).collect();
+            nid.szTip[..text.len()].copy_from_slice(&text);
+            let op = if self.tray_added { NIM_MODIFY } else { NIM_ADD };
+            if Shell_NotifyIconW(op, &nid) != 0 {
+                self.tray_added = true;
+            }
+            if !self.tray_icon.is_null() {
+                DestroyIcon(self.tray_icon);
+            }
+            self.tray_icon = icon;
+        }
+        self.tray_image = Some((rgba.to_vec(), size, tip.to_string()));
+    }
+
+    fn confirm(&mut self, text: &str) -> bool {
+        let text = wide(text);
+        let title = wide("Stickman");
+        unsafe {
+            MessageBoxW(self.host, text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND)
+                == IDYES
         }
     }
 
@@ -581,17 +760,17 @@ impl Platform for Win32Platform {
             build(menu, items);
             let mut pt: POINT = zeroed();
             GetCursorPos(&mut pt);
-            SetForegroundWindow(self.hwnd);
+            SetForegroundWindow(self.host);
             let cmd = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                 pt.x,
                 pt.y,
                 0,
-                self.hwnd,
+                self.host,
                 null(),
             );
-            PostMessageW(self.hwnd, WM_NULL, 0, 0);
+            PostMessageW(self.host, WM_NULL, 0, 0);
             DestroyMenu(menu);
             if cmd > 0 {
                 Some(cmd as u32)
@@ -791,14 +970,31 @@ impl Platform for Win32Platform {
         }
     }
 
-    fn page_boxes(&mut self, id: WinId) -> Option<(Rect, Vec<(Rect, i32)>, f32)> {
+    fn page_boxes(&mut self, id: WinId) -> Option<PageSnapshot> {
         let h = id as usize;
         if let Some(w) = self.uia() {
             w.request(Request::Page(h));
         }
-        let (_, page, t) = self.pages.iter().find(|(k, _, _)| *k == h)?;
+        let (_, page, taken, probe) = self.pages.iter().find(|(k, _, _, _)| *k == h)?;
         let (doc, boxes) = page.as_ref()?;
-        Some((*doc, boxes.clone(), t.elapsed().as_secs_f32()))
+        Some(PageSnapshot { doc: *doc, boxes: boxes.clone(), taken: *taken, probe: *probe })
+    }
+
+    fn track(&mut self, id: WinId, target: Option<Rect>) {
+        let h = id as usize;
+        if target.is_none() {
+            self.probes.retain(|(k, _, _, _)| *k != h);
+        }
+        if let Some(w) = self.uia() {
+            w.request(Request::Track(h, target));
+        }
+    }
+
+    fn page_probe(&mut self, id: WinId) -> Option<(u32, f32, Instant)> {
+        let h = id as usize;
+        // Collect the latest replies first.
+        let _ = self.uia();
+        self.probes.iter().find(|(k, _, _, _)| *k == h).map(|(_, g, top, at)| (*g, *top, *at))
     }
 
     fn window_title(&self, id: WinId) -> String {
@@ -901,7 +1097,7 @@ impl Platform for Win32Platform {
             ScreenToClient(h, &mut pt);
             // Old games are usually not DPI-aware: their messages use
             // unscaled coordinates.
-            let ours = GetDpiForWindow(self.hwnd).max(1) as f32;
+            let ours = GetDpiForSystem().max(1) as f32;
             let theirs = GetDpiForWindow(h).max(1) as f32;
             let k = theirs / ours;
             let cx = (pt.x as f32 * k).round() as i32;
@@ -917,7 +1113,7 @@ impl Platform for Win32Platform {
         unsafe {
             let mut cc: CHOOSECOLORW = zeroed();
             cc.lStructSize = size_of::<CHOOSECOLORW>() as u32;
-            cc.hwndOwner = self.hwnd;
+            cc.hwndOwner = self.host;
             // COLORREF is 0x00BBGGRR.
             cc.rgbResult = initial[0] as u32 | (initial[1] as u32) << 8 | (initial[2] as u32) << 16;
             cc.lpCustColors = self.custom_colors.as_mut_ptr();
@@ -931,16 +1127,10 @@ impl Platform for Win32Platform {
     }
 
     fn keep_on_top(&mut self) {
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+        for o in self.overlays.iter().flatten() {
+            unsafe {
+                SetWindowPos(o.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
         }
     }
 }
@@ -948,13 +1138,20 @@ impl Platform for Win32Platform {
 impl Drop for Win32Platform {
     fn drop(&mut self) {
         unsafe {
-            if !self.bitmap.is_null() {
-                DeleteObject(self.bitmap);
+            for o in self.overlays.drain(..).flatten() {
+                o.destroy();
             }
-            DeleteDC(self.mem_dc);
-            if !self.wheel_hook.is_null() {
-                UnhookWindowsHookEx(self.wheel_hook);
+            if self.tray_added {
+                let mut nid: NOTIFYICONDATAW = zeroed();
+                nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+                nid.hWnd = self.host;
+                nid.uID = 1;
+                Shell_NotifyIconW(NIM_DELETE, &nid);
             }
+            if !self.tray_icon.is_null() {
+                DestroyIcon(self.tray_icon);
+            }
+            DestroyWindow(self.host);
         }
     }
 }

@@ -1,134 +1,240 @@
-//! Learning what you like.
+//! The stickman's learning brain: a tiny neural network that predicts how
+//! much it will enjoy doing something in the situation it's in.
 //!
-//! With "Learn what I like" turned on, every choice the stickman makes is
-//! written to `%APPDATA%\stickman\behaviour_log.jsonl` along with the
-//! situation it was in and how much you reacted in the next few seconds
-//! (picking it up, moving your mouse over to it). Nothing leaves your PC.
+//! * Input: 16 numbers describing the situation (its mood and needs, its
+//!   health, whether a friend or an enemy is nearby, whether the thing it's
+//!   standing on is moving...) plus 12 describing the action (energetic,
+//!   risky, friendly, aggressive, restful...).
+//! * One hidden layer of 20 neurons, one output: "how good will this be".
+//!   About 600 numbers in total, so a decision costs a few microseconds.
 //!
-//! `training/train.py` turns that log into `brain_model.txt`: for each kind
-//! of action, a tiny logistic-regression model of "how likely is this to get
-//! a reaction in this situation". When that file exists the brain nudges its
-//! choices towards what you react to.
+//! It starts from a *base* brain trained by `training/train.py` up to a
+//! deliberate cutoff (just the basics: rest when tired, don't do flips when
+//! hurt, be nice to friends). From then on every stickman keeps learning on
+//! its own: after each thing it does it compares what it expected with what
+//! actually happened (did it get hurt, have fun, make a friend, did you pay
+//! attention, did you praise or scold it) and nudges its weights. Each
+//! stickman ends up with its own brain, saved with it.
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
-/// Number of situation features (see `Brain` for what they are).
-pub const FEATURES: usize = 10;
-pub const FEATURE_NAMES: [&str; FEATURES] = [
+/// Numbers describing the situation.
+pub const CTX: usize = 16;
+/// Numbers describing an action.
+pub const TAGS: usize = 12;
+pub const INPUTS: usize = CTX + TAGS;
+pub const HIDDEN: usize = 20;
+
+pub const CTX_NAMES: [&str; CTX] = [
     "boredom",
     "energy",
+    "health",
     "curiosity",
     "laziness",
     "mischief",
     "playfulness",
-    "health",
     "inside_window",
     "cursor_near",
-    "others_around",
+    "friend_near",
+    "enemy_near",
+    "sleeper_near",
+    "shaky_ground",
+    "height",
+    "attention",
+    "bias",
 ];
 
-/// How long after a choice reactions still count towards it.
-const WINDOW: Duration = Duration::from_secs(8);
-/// Don't let the log grow without bound.
-const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+pub const TAG_NAMES: [&str; TAGS] = [
+    "energetic",
+    "risky",
+    "social",
+    "aggressive",
+    "restful",
+    "playful",
+    "explore",
+    "show_off",
+    "affectionate",
+    "avoid",
+    "stationary",
+    "bias",
+];
+
+/// The base brain, trained by `training/train.py` (GitHub Actions runs it
+/// before every build). If it hasn't been trained, each stickman starts
+/// from a blank brain instead and learns everything itself.
+const BASE: &str = include_str!("base_brain.txt");
 
 fn dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("stickman"))
 }
 
-/// Per action kind: bias and one weight per feature.
-pub struct Model {
-    kinds: Vec<(String, f32, Vec<f32>)>,
+/// One hidden layer: inputs -> tanh -> one value.
+#[derive(Clone, Debug)]
+pub struct Net {
+    w1: Vec<f32>,
+    b1: Vec<f32>,
+    w2: Vec<f32>,
+    b2: f32,
 }
 
-impl Model {
-    /// `brain_model.txt`, if it's been trained.
-    pub fn load() -> Option<Model> {
-        let text = std::fs::read_to_string(dir()?.join("brain_model.txt")).ok()?;
-        Model::parse(&text)
+pub fn input(ctx: &[f32; CTX], tags: &[f32; TAGS]) -> [f32; INPUTS] {
+    let mut x = [0.0; INPUTS];
+    x[..CTX].copy_from_slice(ctx);
+    x[CTX..].copy_from_slice(tags);
+    x
+}
+
+impl Net {
+    /// What a new stickman starts with: your own fine-tuned base
+    /// (`%APPDATA%\stickman\base_brain.txt`, from `train.py finetune`), else
+    /// the one built into the program, else a blank one.
+    pub fn base() -> Net {
+        dir()
+            .and_then(|d| std::fs::read_to_string(d.join("base_brain.txt")).ok())
+            .and_then(|t| Net::parse(&t))
+            .or_else(|| Net::parse(BASE))
+            .unwrap_or_else(Net::blank)
     }
 
-    /// Format: a line "features N", then "Kind bias w1 .. wN" per action.
-    pub fn parse(text: &str) -> Option<Model> {
-        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-        let header = lines.next()?;
-        let n: usize = header.strip_prefix("features ")?.trim().parse().ok()?;
-        if n != FEATURES {
+    /// Whether the built-in base brain was trained (false = learning from scratch).
+    pub fn has_trained_base() -> bool {
+        Net::parse(BASE).is_some()
+    }
+
+    /// Tiny random weights: knows nothing, predicts ~0 for everything.
+    pub fn blank() -> Net {
+        // Fixed little generator so it doesn't need an Rng passed in.
+        let mut seed = 0x2545_F491u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32 - 0.5) * 0.3
+        };
+        Net {
+            w1: (0..HIDDEN * INPUTS).map(|_| next()).collect(),
+            b1: vec![0.0; HIDDEN],
+            w2: (0..HIDDEN).map(|_| next() * 0.3).collect(),
+            b2: 0.0,
+        }
+    }
+
+    fn hidden(&self, x: &[f32; INPUTS]) -> [f32; HIDDEN] {
+        let mut h = [0.0f32; HIDDEN];
+        for (j, hj) in h.iter_mut().enumerate() {
+            let row = &self.w1[j * INPUTS..(j + 1) * INPUTS];
+            let z: f32 = self.b1[j] + row.iter().zip(x.iter()).map(|(w, x)| w * x).sum::<f32>();
+            *hj = z.tanh();
+        }
+        h
+    }
+
+    /// How good it expects this to be (roughly -1..1).
+    pub fn predict(&self, x: &[f32; INPUTS]) -> f32 {
+        let h = self.hidden(x);
+        self.b2 + h.iter().zip(self.w2.iter()).map(|(h, w)| h * w).sum::<f32>()
+    }
+
+    /// Learn from one experience: move the prediction for `x` toward
+    /// `target`. Returns the prediction before learning.
+    pub fn learn(&mut self, x: &[f32; INPUTS], target: f32, lr: f32) -> f32 {
+        let h = self.hidden(x);
+        let y = self.b2 + h.iter().zip(self.w2.iter()).map(|(h, w)| h * w).sum::<f32>();
+        // Clipped so one freak experience can't wreck everything.
+        let err = (y - target).clamp(-1.0, 1.0);
+        for j in 0..HIDDEN {
+            let dh = err * self.w2[j] * (1.0 - h[j] * h[j]);
+            self.w2[j] -= lr * (err * h[j] + 1e-4 * self.w2[j]);
+            self.b1[j] -= lr * dh;
+            let row = &mut self.w1[j * INPUTS..(j + 1) * INPUTS];
+            for (w, xi) in row.iter_mut().zip(x.iter()) {
+                *w -= lr * (dh * xi + 1e-4 * *w);
+            }
+        }
+        self.b2 -= lr * err;
+        y
+    }
+
+    /// Text form: a header line, then all the numbers.
+    pub fn to_text(&self) -> String {
+        let mut out = format!("stickman-net {INPUTS} {HIDDEN}\n");
+        let line = |name: &str, v: &[f32]| {
+            let nums: Vec<String> = v.iter().map(|x| format!("{x:.5}")).collect();
+            format!("{name} {}\n", nums.join(" "))
+        };
+        out += &line("w1", &self.w1);
+        out += &line("b1", &self.b1);
+        out += &line("w2", &self.w2);
+        out += &line("b2", &[self.b2]);
+        out
+    }
+
+    pub fn parse(text: &str) -> Option<Net> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+        let mut head = lines.next()?.split_whitespace();
+        if head.next()? != "stickman-net" {
             return None;
         }
-        let mut kinds = Vec::new();
+        let inputs: usize = head.next()?.parse().ok()?;
+        let hidden: usize = head.next()?.parse().ok()?;
+        if inputs != INPUTS || hidden != HIDDEN {
+            return None;
+        }
+        let mut net = Net { w1: Vec::new(), b1: Vec::new(), w2: Vec::new(), b2: 0.0 };
         for line in lines {
             let mut parts = line.split_whitespace();
-            let Some(kind) = parts.next() else { continue };
+            let name = parts.next()?;
             let nums: Vec<f32> = parts.filter_map(|p| p.parse().ok()).collect();
-            if nums.len() == n + 1 {
-                kinds.push((kind.to_string(), nums[0], nums[1..].to_vec()));
+            match name {
+                "w1" => net.w1 = nums,
+                "b1" => net.b1 = nums,
+                "w2" => net.w2 = nums,
+                "b2" => net.b2 = *nums.first()?,
+                _ => {}
             }
         }
-        (!kinds.is_empty()).then_some(Model { kinds })
-    }
-
-    /// How much to favour (or avoid) this action here: about ±0.3.
-    pub fn bonus(&self, kind: &str, x: &[f32; FEATURES]) -> f32 {
-        let Some((_, b, w)) = self.kinds.iter().find(|(k, _, _)| k == kind) else { return 0.0 };
-        let z = b + w.iter().zip(x.iter()).map(|(w, x)| w * x).sum::<f32>();
-        let p = 1.0 / (1.0 + (-z).exp());
-        (p - 0.5) * 0.6
+        let ok = net.w1.len() == INPUTS * HIDDEN
+            && net.b1.len() == HIDDEN
+            && net.w2.len() == HIDDEN
+            && net.w1.iter().chain(&net.b1).chain(&net.w2).all(|v| v.is_finite());
+        ok.then_some(net)
     }
 }
 
-struct Pending {
-    kind: String,
-    x: [f32; FEATURES],
-    at: Instant,
-    engagement: f32,
+/// One thing it did, the situation, and how it turned out.
+pub struct Experience {
+    pub kind: String,
+    pub ctx: [f32; CTX],
+    pub tags: [f32; TAGS],
+    pub reward: f32,
+    /// Praised or scolded by you.
+    pub taught: bool,
 }
 
-/// Collects choices and your reactions to them, and writes them to the log.
-#[derive(Default)]
-pub struct Logger {
-    pending: Option<Pending>,
-}
+/// Don't let the log grow without bound.
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
-impl Logger {
-    /// The stickman just decided to do `kind` in situation `x`.
-    pub fn chose(&mut self, kind: String, x: [f32; FEATURES]) {
-        self.flush();
-        self.pending = Some(Pending { kind, x, at: Instant::now(), engagement: 0.0 });
+/// Append an experience to `behaviour_log.jsonl` (only with "Keep a
+/// training log" on), for `train.py finetune`.
+pub fn log(e: &Experience) {
+    let Some(dir) = dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("behaviour_log.jsonl");
+    if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        let _ = std::fs::rename(&path, dir.join("behaviour_log.old.jsonl"));
     }
-
-    /// You reacted (picked it up = 1, came over with the mouse = 0.3...).
-    pub fn engaged(&mut self, amount: f32) {
-        if let Some(p) = &mut self.pending {
-            if p.at.elapsed() < WINDOW {
-                p.engagement = (p.engagement + amount).min(1.0);
-            }
-        }
-    }
-
-    /// Call now and then: writes out choices whose time is up.
-    pub fn tick(&mut self) {
-        if self.pending.as_ref().is_some_and(|p| p.at.elapsed() >= WINDOW) {
-            self.flush();
-        }
-    }
-
-    fn flush(&mut self) {
-        let Some(p) = self.pending.take() else { return };
-        let Some(dir) = dir() else { return };
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("behaviour_log.jsonl");
-        if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-            // Keep the newer half-ish: start a fresh file, keep the old one.
-            let _ = std::fs::rename(&path, dir.join("behaviour_log.old.jsonl"));
-        }
-        let xs: Vec<String> = p.x.iter().map(|v| format!("{v:.3}")).collect();
-        let line = format!("{{\"kind\":\"{}\",\"x\":[{}],\"engagement\":{:.2}}}\n", p.kind, xs.join(","), p.engagement);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = f.write_all(line.as_bytes());
-        }
+    let nums = |v: &[f32]| v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(",");
+    let line = format!(
+        "{{\"kind\":\"{}\",\"x\":[{}],\"a\":[{}],\"r\":{:.3},\"taught\":{}}}\n",
+        e.kind,
+        nums(&e.ctx),
+        nums(&e.tags),
+        e.reward,
+        e.taught
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -137,18 +243,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_round_trip() {
-        let text = "features 10\nJump 0.5 1 0 0 0 0 0 0 0 0 0\nSleep -2 0 0 0 0 0 0 0 0 0 0\n";
-        let m = Model::parse(text).expect("model");
-        let bored = [1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0];
-        // Liked: positive nudge. Disliked: negative. Unknown: none.
-        assert!(m.bonus("Jump", &bored) > 0.1);
-        assert!(m.bonus("Sleep", &bored) < -0.1);
-        assert_eq!(m.bonus("Dance", &bored), 0.0);
+    fn text_round_trip() {
+        let net = Net::blank();
+        let back = Net::parse(&net.to_text()).expect("parse");
+        let x = [0.5; INPUTS];
+        assert!((net.predict(&x) - back.predict(&x)).abs() < 1e-3);
+        assert!(Net::parse("stickman-net 3 2\nw1 1 2\n").is_none());
+        assert!(Net::parse("not trained yet").is_none());
     }
 
     #[test]
-    fn rejects_wrong_feature_count() {
-        assert!(Model::parse("features 3\nJump 0 1 2 3\n").is_none());
+    fn learns_from_experience() {
+        let mut net = Net::blank();
+        let mut good = [0.0; INPUTS];
+        good[0] = 1.0;
+        good[INPUTS - 1] = 1.0;
+        let mut bad = [0.0; INPUTS];
+        bad[1] = 1.0;
+        bad[INPUTS - 1] = 1.0;
+        for _ in 0..400 {
+            net.learn(&good, 0.8, 0.05);
+            net.learn(&bad, -0.8, 0.05);
+        }
+        assert!(net.predict(&good) > 0.5, "{}", net.predict(&good));
+        assert!(net.predict(&bad) < -0.5, "{}", net.predict(&bad));
     }
 }

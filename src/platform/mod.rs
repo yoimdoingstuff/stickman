@@ -1,21 +1,24 @@
 //! OS integration. Everything platform-specific lives behind `Platform`,
 //! so macOS / Linux backends can be added later without touching the rest.
 
+use std::time::Instant;
+
 use crate::math::{Rect, Vec2};
 use crate::world::{Taskbar, WinId, WinInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
-    MouseDown,
-    MouseUp,
-    RightClick,
+    /// Mouse pressed / released / right-clicked on a stickman (by its
+    /// overlay slot).
+    MouseDown { slot: usize },
+    MouseUp { slot: usize },
+    RightClick { slot: usize },
+    /// The tray icon was clicked.
+    Tray,
     Quit,
     /// Something changed in the settings panel: for a checkbox the new
     /// state (0/1), for a dropdown the chosen index, for a button 0.
     Setting { id: u32, value: i32 },
-    /// The mouse wheel turned (anywhere on screen): where the cursor was,
-    /// and how many notches (positive = scrolling up).
-    Wheel { at: Vec2, notches: f32 },
 }
 
 /// One row in the settings panel.
@@ -24,6 +27,17 @@ pub enum SettingItem {
     Check { id: u32, label: String, on: bool },
     Choice { id: u32, label: String, options: Vec<String>, selected: usize },
     Button { id: u32, label: String },
+}
+
+/// A web page's boxes as read at one moment.
+#[derive(Clone)]
+pub struct PageSnapshot {
+    pub doc: Rect,
+    pub boxes: Vec<(Rect, i32)>,
+    pub taken: Instant,
+    /// Where the tracked box (see `Platform::track`) was at that moment:
+    /// (which tracking, its top).
+    pub probe: Option<(u32, f32)>,
 }
 
 pub struct MenuItem {
@@ -60,9 +74,18 @@ pub trait Platform {
     fn window_rect(&self, id: WinId) -> Option<Rect>;
     fn cursor(&self) -> Vec2;
     fn dpi_scale(&self) -> f32;
-    /// Show a premultiplied RGBA frame at screen position (x, y), with the
-    /// parts under `occluders` cut out.
-    fn present(&mut self, rgba: &[u8], width: u32, height: u32, x: i32, y: i32, occluders: &[Rect]);
+    /// A new transparent window to draw one stickman in. Returns its slot.
+    fn create_overlay(&mut self) -> usize;
+    fn destroy_overlay(&mut self, slot: usize);
+    /// Show a premultiplied RGBA frame in an overlay at screen position
+    /// (x, y), with the parts under `occluders` cut out.
+    #[allow(clippy::too_many_arguments)]
+    fn present(&mut self, slot: usize, rgba: &[u8], width: u32, height: u32, x: i32, y: i32, occluders: &[Rect]);
+    /// Put (or update) the icon in the notification area. `rgba` is a
+    /// square straight-alpha image.
+    fn set_tray(&mut self, rgba: &[u8], size: u32, tip: &str);
+    /// Ask a yes/no question.
+    fn confirm(&mut self, text: &str) -> bool;
     fn show_menu(&mut self, items: &[MenuItem]) -> Option<u32>;
     /// Open a colour picker. Returns the chosen RGB, or None if cancelled.
     fn pick_color(&mut self, initial: [u8; 3]) -> Option<[u8; 3]>;
@@ -88,10 +111,14 @@ pub trait Platform {
     /// Press the element in `id` whose accessibility name starts with
     /// `name_prefix` (falls back to clicking at `at`).
     fn press(&mut self, id: WinId, name_prefix: &str, at: Vec2);
-    /// The page in a browser window: its rect, every box on it (with its
-    /// control type), and how old that is in seconds. Background-fetched
-    /// like `ui_elements`.
-    fn page_boxes(&mut self, id: WinId) -> Option<(Rect, Vec<(Rect, i32)>, f32)>;
+    /// The page in a browser window: its rect and every box on it (with its
+    /// control type). Background-fetched like `ui_elements`.
+    fn page_boxes(&mut self, id: WinId) -> Option<PageSnapshot>;
+    /// Follow one box on a page closely (its rect as of the latest
+    /// snapshot), so scrolling is seen straight away; None stops.
+    fn track(&mut self, id: WinId, target: Option<Rect>);
+    /// The tracked box's latest top: (which tracking, top, when measured).
+    fn page_probe(&mut self, id: WinId) -> Option<(u32, f32, Instant)>;
     /// (name, screen rect) of each icon on the desktop. Background-fetched:
     /// returns the latest list (empty at first).
     fn desktop_icons(&mut self) -> Vec<(String, Rect)>;

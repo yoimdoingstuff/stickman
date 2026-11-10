@@ -24,6 +24,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # The base brain every new stickman starts with, trained up to its
+      # cutoff and built into the exe.
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Train the base brain
+        run: |
+          pip install numpy
+          python training/train.py pretrain
+
       - name: Build (release)
         run: cargo build --release
 

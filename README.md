@@ -20,14 +20,28 @@ To build locally instead: install Rust (https://rustup.rs) and run
   ragdoll). Throw it hard and it flops; drop it gently and it lands on its feet.
 - **Drop it onto a window** and it lives inside that window, walking along
   its bottom edge until it decides to jump out.
-- **Right-click** it for a short menu: Ragdoll, Come here, Settings..., Quit.
-  **Settings** opens a panel with everything else: colour, outline, stay in
-  front, cursor grabbing, desktop icons, web pages, pause, gravity, and the
-  game helpers.
-- **Run `stickman.exe` more than once** (up to 16) and the stickmen notice
-  each other: they wander over, wave, punch, hold grudges, and knock each
-  other over when thrown into one another. They talk over UDP on
-  `127.0.0.1` only, so nothing leaves your PC.
+- **Right-click** a stickman for its menu: Ragdoll, Come here, Change
+  colour, Good job! / Don't do that!, Send home, Settings, Quit.
+  **Settings** opens a panel with everything else: outline, stay in front,
+  cursor grabbing, desktop icons, web pages, pause, gravity, and the game
+  helpers.
+- **The tray icon** (next to the clock) manages everyone: each stickman's
+  menu, add a stickman, bring back ones you sent home, forget one forever,
+  pause everyone, settings, quit.
+- **More stickmen:** "Add a stickman", or just run `stickman.exe` again. All
+  stickmen live in one program (running it again only asks the running one
+  for another stickman), so a crowd is still light on your PC.
+- **They're saved.** When you quit (or shut down), everyone out on the
+  desktop is saved, with everything they've learned and who their friends
+  are, and they're back next time. "Send home" saves one without deleting
+  it. Saves are in `%APPDATA%\stickman\stickmen`.
+
+**Windows Defender / SmartScreen.** The exe isn't code-signed (that costs
+money), so Windows may warn about it, and antivirus heuristics sometimes
+flag new unsigned programs. It doesn't hook your keyboard or mouse, and
+everything it does is in this repository. If Defender flags it, you can
+report it as a false positive at
+https://www.microsoft.com/en-us/wdsi/filesubmission.
 
 On its own it walks, runs, sits, dances, waves, backflips, cartwheels, jumps
 between windows, climbs window sides, walks behind windows, hops into
@@ -76,9 +90,21 @@ and then it ignores all its reasoning and just does something.
 around, and ragdolls pile up on each other. A stickman may sneak over to
 one that's asleep and poke it awake (or, if it's mischievous, kick it).
 
+**Friends and enemies.** Every stickman has its own feelings about every
+other one. Time spent near each other slowly makes friends; hits make
+enemies. Friends high-five, hang out together and wake each other gently.
+Enemies pick fights, or get avoided when a stickman is hurt. Hit someone's
+friend and they may jump in to defend them. Friendships are saved.
+
 **Fights.** Once two stickmen start fighting they keep at it for several
 seconds: closing in, mixing punches and kicks, backing off, guarding, and
 waiting for the other to get up.
+
+**Body language.** They never say a word. How they feel shows in how they
+move: a startled jolt with arms flung up, a puzzled head-scratch when
+trying something new, a cheer when happy, an angry stomp with clenched
+fists, a sad slump with the head hanging, a fist pump when something went
+better than expected.
 
 **Moving windows.** It isn't glued on: friction only lets it keep up so
 fast, so if you yank a window it slides out from under it (it stumbles,
@@ -116,11 +142,12 @@ browsers, the boxes on the page you're looking at (text blocks, images,
 buttons, links) become ledges. Once it's inside the browser window (it
 likes to dive in through the taskbar to explore, or drop it in yourself) it
 hops from box to box, walks along them, sits on their edges and falls off
-them. It reacts to scrolling straight away (it watches the mouse wheel, and
-nothing else, over pages): scroll down and it's carried up and off the top,
-into the page, hidden behind the browser's toolbar until you scroll back;
-scroll up fast and the page drops away under it, so it falls down through
-the page onto whatever's below. Other apps work the same way once it's
+them. It moves with the box it's standing on, checked many times a
+second, so scrolling (wheel, touchpad, scrollbar or keys) carries it along
+exactly; if the box doesn't move (a fixed toolbar), neither does it. Scroll
+down and it's carried up and off the top, into the page, hidden behind the
+browser's toolbar until you scroll back; scroll up fast and the page drops
+away under it, so it falls down through the page onto whatever's below. Other apps work the same way once it's
 inside them: Discord, Spotify, Slack and friends (built on a browser
 engine), and anything else that describes itself to accessibility tools,
 including cards and tiles in some games.
@@ -133,12 +160,32 @@ is on, they snap back.
 **Multiple screens.** It roams all your monitors, walking along the bottom
 of each one.
 
-**Learning what you like** (off by default): with "Learn what I like" on,
-it logs each thing it does and whether you reacted (picked it up, hovered
-over it) to `%APPDATA%\stickman\behaviour_log.jsonl`. Run
-`python training/train.py` (needs `pip install numpy`) to train a small
-model from that log; next time it starts, it leans towards the things you
-react to. Nothing leaves your PC.
+**A brain that learns.** Each stickman has a tiny neural network (about 600
+numbers, a few microseconds per decision) that predicts how much it'll
+enjoy each thing it could do, in the situation it's in: how bored or tired
+it is, whether it's hurt, whether a friend or an enemy is nearby, whether
+what it's standing on is moving, whether you're watching.
+
+* **It starts with the basics.** Every new stickman gets a copy of a base
+  brain trained (by `training/train.py`, run automatically when the exe is
+  built) only up to a cutoff: rest when tired, no flips when hurt, be nice to
+  friends, show off when you're watching. The rest it has to learn.
+* **It learns by itself.** After everything it does, it compares what it
+  expected with what happened (did it get hurt, have fun, make a friend, did
+  you pay attention) and adjusts. Early on it goes mostly on instinct; the
+  more it has experienced, the more it trusts what it learned. It stays
+  curious about things it hasn't tried much.
+* **You can teach it.** "Good job!" or "Don't do that!" (right-click, or its
+  tray menu) rewards or punishes what it's doing right now, and counts for
+  much more than its own experience. Stroking its head with the mouse counts
+  as praise.
+* Each stickman ends up with its own brain, saved with it. Nothing leaves
+  your PC.
+
+With "Keep a training log" on (Settings), everything they experience is
+logged to `%APPDATA%\stickman\behaviour_log.jsonl`;
+`python training/train.py finetune` (needs `pip install numpy`) turns that
+into a better base brain for future stickmen.
 
 **Gravity** can be changed from the right-click menu (Moon to Jupiter).
 Lower gravity also means higher, floatier jumps.
@@ -169,17 +216,17 @@ one, so it stays visible on any background.
 
 | File | What it does |
 | --- | --- |
-| `src/platform/` | OS layer behind a `Platform` trait. `win32.rs` is a tiny per-pixel-alpha layered window that follows the stickman, plus window enumeration in z-order. |
+| `src/platform/` | OS layer behind a `Platform` trait. `win32.rs`: one tiny per-pixel-alpha layered window per stickman, the tray icon, window enumeration in z-order. `uia.rs`: UI Automation on a background thread (taskbar buttons, page boxes, following the box a stickman stands on). |
+| `src/instance.rs`, `src/roster.rs` | One program for all stickmen; saving and loading them. |
 | `src/world.rs` | Turns windows into surfaces (top edges), walls (side edges) and occluders (windows above the stickman's layer). |
 | `src/stickman.rs` | Body physics and actions: walk, jump (ballistic, aimed at a landing spot), climb, mantle, drag/throw. |
 | `src/rig.rs` | Procedural animation: planted feet/hands that step when they drift too far, two-bone IK for knees/elbows, springs for lean, squash and dangling limbs. No keyframes. |
 | `src/ragdoll.rs` | Verlet ragdoll: joints are particles, bones are distance constraints, with pins for dragging and cursor-hanging. |
-| `src/peers.rs` | Finds other running stickmen over localhost UDP and sends/receives hits. |
 | `src/settings.rs` | Loads/saves the settings file. |
-| `src/learn.rs`, `training/train.py` | Logging what it does and how you react; training and loading the "what you like" model. |
+| `src/learn.rs`, `training/train.py` | The learning network (online learning in Rust), the base brain's training with its cutoff, and fine-tuning from logs. |
 | `src/games/` | Recognising the classic games, and the Minesweeper helper. |
 | `src/render.rs` | Draws the pose with tiny-skia. |
-| `src/brain.rs` | `Brain` trait + a utility AI with personality and needs (boredom, energy). Meant to be swapped for a small trained model later. |
+| `src/brain.rs` | Instinct (personality and needs) blended with the learning network, relationships, feelings, teaching. |
 
 **Walking behind windows:** the overlay is always on top, but each frame the
 pixels covered by windows that are "in front" of the stickman's layer are cut
@@ -194,6 +241,10 @@ out, so it looks like it's behind them.
 4. ~~Kick desktop icons around (opt-in)~~; picking them up and carrying them
 5. ~~Multi-monitor support~~
 6. ~~Learn from you: log, Python trainer, model loaded in Rust~~
-7. macOS / Linux backends (everything OS-specific is behind the `Platform`
+7. ~~A brain that keeps learning by itself and from your teaching~~
+8. ~~All stickmen in one program, friends and enemies, saving, tray icon~~
+9. Mods: add things for them to discover and play with (e.g. pick up the
+   Minecraft icon and do Minecraft-y things), learning about them as they go
+10. macOS / Linux backends (everything OS-specific is behind the `Platform`
    trait in `src/platform/`, so a backend is "only" that file's worth of
    window, overlay and accessibility code per OS)

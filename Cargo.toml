@@ -8,7 +8,8 @@ description = "A procedurally animated stickman that lives on your desktop"
 tiny-skia = "0.11"
 
 [build-dependencies]
-embed-manifest = "1.4"
+# Version info, icon and manifest for the exe.
+winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # Only for UI Automation (COM): reading the taskbar's buttons.

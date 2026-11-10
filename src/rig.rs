@@ -38,6 +38,57 @@ pub enum Gesture {
     Spin,
     /// Baseball slide: low, leaning back, feet first.
     Slide,
+    /// 0..1: hand going up for a high-five.
+    HighFive(f32),
+    /// Body language (see `Feeling`).
+    Startle,
+    Cheer,
+    Fume,
+    Slump,
+    FistPump,
+}
+
+/// How it feels about something that just happened. It never says a word:
+/// each one comes out as body language for a moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feeling {
+    /// Jolts, arms flung up.
+    Startled,
+    /// Scratches its head, head tilted (trying something new).
+    Puzzled,
+    /// Arms up in a V, bouncing (a friend, a high-five, your praise).
+    Happy,
+    /// Fists clenched, stomping, leaning in.
+    Angry,
+    /// Slumped, head hanging (scolded, lost).
+    Sad,
+    /// Fist pump (that went better than expected).
+    Proud,
+}
+
+impl Feeling {
+    pub fn gesture(self) -> Gesture {
+        match self {
+            Feeling::Startled => Gesture::Startle,
+            Feeling::Puzzled => Gesture::Scratch,
+            Feeling::Happy => Gesture::Cheer,
+            Feeling::Angry => Gesture::Fume,
+            Feeling::Sad => Gesture::Slump,
+            Feeling::Proud => Gesture::FistPump,
+        }
+    }
+
+    /// How long it shows.
+    pub fn secs(self) -> f32 {
+        match self {
+            Feeling::Startled => 0.6,
+            Feeling::Puzzled => 1.4,
+            Feeling::Happy => 1.3,
+            Feeling::Angry => 1.4,
+            Feeling::Sad => 2.2,
+            Feeling::Proud => 0.9,
+        }
+    }
 }
 
 impl Gesture {
@@ -403,6 +454,11 @@ impl Rig {
         self.squash.v += (impact * 0.16).min(380.0);
     }
 
+    /// A startled jolt: the body springs up for a moment.
+    pub fn jolt(&mut self, amount: f32) {
+        self.squash.v -= amount;
+    }
+
     pub fn update(&mut self, inp: &RigInput, d: &Dims, dt: f32) {
         let s = d.s;
         let f = inp.facing;
@@ -478,7 +534,10 @@ impl Rig {
                     // Sitting: bottom actually on the ground.
                     + sitk * (d.stance - 2.0 * s)
                     + g.hip * s * (1.0 - sitk)
-                    + (if gesture == Gesture::Balance { 2.5 * s } else { 0.0 });
+                    + (if gesture == Gesture::Balance { 2.5 * s } else { 0.0 })
+                    // Slumped: sags. Cheering: bounces on the spot.
+                    + (if gesture == Gesture::Slump { 2.0 * s } else { 0.0 })
+                    - (if gesture == Gesture::Cheer { (t * 9.0).sin().abs() * 2.5 * s } else { 0.0 });
                 // Bob from stepping (replaced by the proper gait when walking).
                 let step_bob =
                     -(self.feet[0].lift_amount() + self.feet[1].lift_amount()) * (1.0 + run * 1.5) * (1.0 + g.bounce) * s;
@@ -554,6 +613,10 @@ impl Rig {
                         Gesture::TapFoot if !self.feet[1].stepping => {
                             self.feet[1].pos.y = ground_y - (t * 9.0).sin().abs() * 2.5 * s;
                         }
+                        Gesture::Fume if !self.feet[1].stepping => {
+                            // Angry stomping.
+                            self.feet[1].pos.y = ground_y - (t * 7.0).sin().max(0.0) * 5.0 * s;
+                        }
                         Gesture::Kick(e) => {
                             let leg = d.thigh + d.shin;
                             let target = if e < 0.0 {
@@ -582,6 +645,10 @@ impl Rig {
                     Gesture::Box => base_lean + f * 0.08,
                     Gesture::Dance => base_lean + (t * 3.5).sin() * 0.15,
                     Gesture::Balance => base_lean + (t * 7.0).sin() * 0.18 + wobble(t * 1.7, seed + 31.0) * 0.1,
+                    Gesture::Fume => base_lean + f * 0.14,
+                    Gesture::Slump => base_lean + f * 0.28,
+                    Gesture::Startle => base_lean - f * 0.12,
+                    Gesture::Cheer => base_lean - f * 0.06,
                     _ if plain_sit => base_lean + (if legs_out { -f * 0.22 * sitk } else { f * 0.08 * sitk }),
                     _ => base_lean - f * sitk * 0.05,
                 };
@@ -626,7 +693,15 @@ impl Rig {
         let neck = chest + up * d.neck;
         // Head drifts around on its own (looking about, little nods).
         let drift = wobble(t * 0.4, seed + 7.0) * 0.22 * idle_k;
-        self.tilt.update(f * 0.12 + a * 0.4 + drift, 2.5, 0.5, dt);
+        // Feelings show in the head too: hanging it, cocking it, throwing it back.
+        let mood = match gesture {
+            Gesture::Slump => f * 0.6,
+            Gesture::Scratch => -f * 0.3,
+            Gesture::Cheer | Gesture::FistPump => -f * 0.25,
+            Gesture::Fume => f * 0.2 + (t * 14.0).sin() * 0.08,
+            _ => 0.0,
+        };
+        self.tilt.update(f * 0.12 + a * 0.4 + drift + mood, 2.5, 0.5, dt);
         let head = neck + v2(self.tilt.x.sin(), -self.tilt.x.cos()) * d.head_r;
 
         // ---- arms ----
@@ -754,6 +829,35 @@ impl Rig {
                             // One hand dragging behind, one thrown up.
                             target = if i == 0 { v2(hip.x - f * 6.0 * s, ground_y) } else { chest + v2(f * 4.0 * s, -18.0 * s) };
                             freq = 10.0;
+                        }
+                        Gesture::HighFive(e) if i == 1 => {
+                            target = chest + v2(f * (5.0 * s + arm * 0.45 * e), -(6.0 * s + arm * 0.6 * e));
+                            freq = 11.0;
+                        }
+                        Gesture::Startle => {
+                            // Arms flung up and out.
+                            target = chest + v2(side * 10.0 * s + f * 2.0 * s, -14.0 * s);
+                            freq = 14.0;
+                        }
+                        Gesture::Cheer => {
+                            // Both arms up in a V, pumping.
+                            let pump = (t * 9.0 + fi * 0.4).sin().abs();
+                            target = chest + v2(side * (7.0 + pump * 2.0) * s, -arm * (0.75 + pump * 0.12));
+                            freq = 10.0;
+                        }
+                        Gesture::Fume => {
+                            // Fists clenched at its sides, shaking.
+                            target = chest + v2(side * 5.0 * s + f * 3.0 * s, arm * 0.6 + (t * 20.0 + fi).sin() * s);
+                            freq = 12.0;
+                        }
+                        Gesture::Slump => {
+                            // Arms hanging limp.
+                            target = chest + v2(side * 1.5 * s + f * 3.0 * s, arm * 0.97);
+                            freq = 3.5;
+                        }
+                        Gesture::FistPump if i == 1 => {
+                            target = chest + v2(f * 3.0 * s, -arm * 0.9 + (t * 12.0).sin().abs() * 4.0 * s);
+                            freq = 12.0;
                         }
                         _ if style == WalkStyle::Panic => {
                             // Arms flailing over its head.

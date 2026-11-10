@@ -3,45 +3,47 @@
 
 mod brain;
 mod games;
+mod instance;
 mod learn;
 mod math;
-mod peers;
 mod platform;
 mod ragdoll;
 mod render;
 mod rig;
 mod rng;
+mod roster;
 mod settings;
 mod stickman;
 mod world;
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use brain::{Brain, BrainEvent, PeerView, Personality, UtilityBrain};
 use games::minesweeper::{Helper, Look};
 use games::{Game, GameEvent, Watcher};
 use math::{v2, Rect, Vec2};
-use peers::{Incoming, Me, Peers};
-use platform::{Event, MenuItem, SettingItem};
+use platform::{Event, MenuItem, Platform, SettingItem};
 use render::Style;
+use rng::Rng;
 use settings::Settings;
 use stickman::{Dims, Mode, Stickman};
-use world::{button_matches, icon_key, page_ledges, Page, PeerBody, WinId, World};
+use world::{button_matches, icon_key, ledge_key, page_ledges, Page, PeerBody, Support, WinId, World};
 
 /// Fixed physics/animation step.
 const STEP: f32 = 1.0 / 120.0;
-/// How often to re-scan all windows (the one we're on is polled every frame).
+/// How often to re-scan all windows (the ones being moved are polled every frame).
 const WINDOW_SCAN: f32 = 0.15;
 /// How often to re-read the taskbar's buttons.
 const DOOR_SCAN: f32 = 2.0;
+/// How often everyone is saved (they're also saved when the program closes).
+const AUTOSAVE: f32 = 120.0;
 /// Base size multiplier on top of the monitor's DPI scale.
 const SIZE: f32 = 1.15;
 
 const MENU_FRONT: u32 = 1;
 const MENU_PAUSE: u32 = 2;
-const MENU_COME: u32 = 3;
 const MENU_COLOR: u32 = 4;
-const MENU_LIMP: u32 = 5;
 const MENU_OUTLINE: u32 = 6;
 const MENU_CURSOR: u32 = 7;
 const MENU_MS_HELP: u32 = 8;
@@ -53,6 +55,7 @@ const MENU_WEB: u32 = 13;
 const MENU_FOLDER: u32 = 14;
 const MENU_MOVE_ICONS: u32 = 15;
 const MENU_LEARN: u32 = 16;
+const MENU_ADD: u32 = 17;
 /// Gravity dropdown (value = index into GRAVITY_PRESETS).
 const MENU_GRAVITY: u32 = 20;
 const GRAVITY_PRESETS: [(&str, f32); 5] = [
@@ -63,6 +66,17 @@ const GRAVITY_PRESETS: [(&str, f32); 5] = [
     ("Jupiter (2.5x)", 2.5),
 ];
 const MENU_QUIT: u32 = 99;
+/// One stickman's menu: MENU_BUDDY + slot * 10 + one of the B_ codes.
+const MENU_BUDDY: u32 = 1000;
+const B_LIMP: u32 = 0;
+const B_COME: u32 = 1;
+const B_COLOR: u32 = 2;
+const B_GOOD: u32 = 3;
+const B_BAD: u32 = 4;
+const B_HOME: u32 = 5;
+const B_FORGET: u32 = 6;
+/// "Bring back": MENU_BRING + index into the stickmen who are at home.
+const MENU_BRING: u32 = 5000;
 
 /// Browsers, and apps built on a browser engine (Discord, Spotify, Slack...),
 /// whose contents it can explore (they all expose their page's boxes
@@ -93,14 +107,6 @@ fn has_web_content(exe: &str) -> bool {
             | "notion.exe"
             | "code.exe"
     )
-}
-
-/// How far one mouse-wheel notch scrolls a page (at 100% scaling).
-fn scroll_step(exe: &str) -> f32 {
-    match exe {
-        "firefox.exe" | "librewolf.exe" | "waterfox.exe" | "floorp.exe" | "zen.exe" => 57.0,
-        _ => 100.0,
-    }
 }
 
 /// A desktop icon flying through the air after being kicked.
@@ -140,6 +146,110 @@ impl IconFlight {
     }
 }
 
+/// One stickman out on the desktop.
+struct Buddy {
+    id: u32,
+    name: String,
+    color: [u8; 3],
+    style: Style,
+    man: Stickman,
+    brain: UtilityBrain,
+    /// Its overlay window.
+    slot: usize,
+    /// How much you've been paying attention to it lately (0..1).
+    attention: f32,
+    /// Being stroked with the mouse.
+    pet: f32,
+    body_hit_cooldown: f32,
+}
+
+impl Buddy {
+    fn saved(&self, present: bool) -> roster::Saved {
+        roster::Saved { id: self.id, name: self.name.clone(), color: self.color, present, brain: self.brain.save() }
+    }
+
+    /// Its own menu (right-click, or its entry in the tray menu).
+    fn menu(&self) -> Vec<MenuItem> {
+        let id = |code: u32| MENU_BUDDY + self.slot as u32 * 10 + code;
+        vec![
+            MenuItem::new(id(B_LIMP), "Ragdoll", false),
+            MenuItem::new(id(B_COME), "Come here", false),
+            MenuItem::new(id(B_COLOR), "Change colour...", false),
+            MenuItem::separator(),
+            MenuItem::new(id(B_GOOD), "Good job!", false),
+            MenuItem::new(id(B_BAD), "Don't do that!", false),
+            MenuItem::separator(),
+            MenuItem::new(id(B_HOME), "Send home (it's saved)", false),
+        ]
+    }
+}
+
+/// Put a stickman on the desktop.
+#[allow(clippy::too_many_arguments)]
+fn spawn(
+    plat: &mut dyn Platform,
+    d: Dims,
+    world: &World,
+    settings: &Settings,
+    rng: &mut Rng,
+    id: u32,
+    name: String,
+    color: [u8; 3],
+    brain: UtilityBrain,
+) -> Buddy {
+    let s = d.s;
+    let at = v2(world.work.l + world.work.width() * rng.range(0.15, 0.85), world.work.t + 80.0 * s);
+    let mut man = Stickman::new(d, at);
+    man.force_front = settings.stay_in_front;
+    man.allow_cursor = settings.grab_cursor;
+    man.gravity = settings.gravity;
+    man.move_icons = settings.move_icons;
+    Buddy {
+        id,
+        name,
+        color,
+        style: Style::new(color, settings.outline),
+        man,
+        brain,
+        slot: plat.create_overlay(),
+        attention: 0.0,
+        pet: 0.0,
+        body_hit_cooldown: 0.0,
+    }
+}
+
+/// A brand-new stickman with a random personality and a fresh copy of the
+/// base brain.
+fn spawn_new(
+    plat: &mut dyn Platform,
+    d: Dims,
+    world: &World,
+    settings: &Settings,
+    rng: &mut Rng,
+    buddies: &[Buddy],
+    home: &[roster::Saved],
+) -> Buddy {
+    let ids: Vec<u32> = buddies.iter().map(|b| b.id).chain(home.iter().map(|h| h.id)).collect();
+    let names: Vec<String> = buddies.iter().map(|b| b.name.clone()).chain(home.iter().map(|h| h.name.clone())).collect();
+    let id = roster::new_id(&ids);
+    let name = roster::new_name(&names, rng.f32());
+    let brain = UtilityBrain::new(id, Personality::random(rng));
+    spawn(plat, d, world, settings, rng, id, name, settings.color, brain)
+}
+
+/// A saved stickman coming back, brain and all.
+fn spawn_saved(
+    plat: &mut dyn Platform,
+    d: Dims,
+    world: &World,
+    settings: &Settings,
+    rng: &mut Rng,
+    saved: roster::Saved,
+) -> Buddy {
+    let brain = UtilityBrain::load(saved.id, &saved.brain).unwrap_or_else(|| UtilityBrain::new(saved.id, Personality::random(rng)));
+    spawn(plat, d, world, settings, rng, saved.id, saved.name, saved.color, brain)
+}
+
 /// The rectangle covering all of these.
 fn union(rects: &[Rect]) -> Rect {
     rects.iter().fold(rects.first().copied().unwrap_or(Rect { l: 0.0, t: 0.0, r: 1.0, b: 1.0 }), |a, r| Rect {
@@ -151,23 +261,22 @@ fn union(rects: &[Rect]) -> Rect {
 }
 
 /// What the settings panel shows.
-fn settings_items(settings: &Settings, man: &Stickman, paused: bool) -> Vec<SettingItem> {
+fn settings_items(settings: &Settings, paused: bool) -> Vec<SettingItem> {
     let check = |id: u32, label: &str, on: bool| SettingItem::Check { id, label: label.to_string(), on };
     let button = |id: u32, label: &str| SettingItem::Button { id, label: label.to_string() };
     let heading = |t: &str| SettingItem::Heading(t.to_string());
     let gravity = GRAVITY_PRESETS.iter().position(|(_, g)| (settings.gravity - g).abs() < 0.01).unwrap_or(2);
     vec![
         heading("Looks"),
-        button(MENU_COLOR, "Change colour..."),
+        button(MENU_COLOR, "Colour for new stickmen..."),
         check(MENU_OUTLINE, "Show outline", settings.outline),
         heading("Behaviour"),
-        check(MENU_FRONT, "Always stay in front of windows", man.force_front),
-        check(MENU_CURSOR, "Can grab my mouse cursor", man.allow_cursor),
+        check(MENU_FRONT, "Always stay in front of windows", settings.stay_in_front),
+        check(MENU_CURSOR, "Can grab my mouse cursor", settings.grab_cursor),
         check(MENU_ICONS, "Play on my desktop icons", settings.desktop_icons),
         check(MENU_WEB, "Explore web pages and apps", settings.web_pages),
         check(MENU_MOVE_ICONS, "Can kick my desktop icons around (really moves them)", settings.move_icons),
-        check(MENU_LEARN, "Learn what I like (keeps a log on this PC)", settings.learn),
-        check(MENU_PAUSE, "Pause thinking", paused),
+        check(MENU_PAUSE, "Pause everyone's thinking", paused),
         SettingItem::Choice {
             id: MENU_GRAVITY,
             label: "Gravity".into(),
@@ -179,6 +288,8 @@ fn settings_items(settings: &Settings, man: &Stickman, paused: bool) -> Vec<Sett
         check(MENU_MS_MISTAKES, "Let it make mistakes (can lose you the game)", settings.minesweeper_mistakes),
         button(MENU_MS_SNAPSHOT, "Save Minesweeper snapshot"),
         heading("Other"),
+        button(MENU_ADD, "Add a stickman"),
+        check(MENU_LEARN, "Keep a training log (for training/train.py)", settings.learn),
         button(MENU_FOLDER, "Open settings folder"),
     ]
 }
@@ -233,8 +344,28 @@ fn guarded<T>(enabled: &mut bool, f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
+/// The tray icon, in the colour new stickmen get.
+fn update_tray(plat: &mut dyn Platform, settings: &Settings, count: usize) {
+    let size = 32;
+    if let Some(icon) = render::icon(size, settings.color) {
+        let tip = match count {
+            0 => "Stickman (everyone's at home)".to_string(),
+            1 => "Stickman: 1 out".to_string(),
+            n => format!("Stickman: {n} out"),
+        };
+        plat.set_tray(icon.data(), size, &tip);
+    }
+}
+
 fn main() {
     install_crash_log();
+    // One program for all the stickmen: if one is already running, it adds
+    // a stickman for us and we're done.
+    let host = match instance::start() {
+        instance::Start::Forwarded => return,
+        instance::Start::Host(h) => Some(h),
+        instance::Start::Alone => None,
+    };
     let mut plat = match platform::create() {
         Ok(p) => p,
         Err(e) => {
@@ -244,7 +375,7 @@ fn main() {
     };
     let d = Dims::new(plat.dpi_scale() * SIZE);
     let s = d.s;
-    let mut rng = rng::Rng::seeded();
+    let mut rng = Rng::seeded();
     let screens = plat.screens();
     let mut world = World {
         work: union(&screens),
@@ -257,35 +388,42 @@ fn main() {
         pages: Vec::new(),
         icons: Vec::new(),
     };
+    let mut settings = Settings::load();
+
+    // Everyone who was out last time comes back; the rest stay at home
+    // (they can be brought back from the tray menu).
+    let mut buddies: Vec<Buddy> = Vec::new();
+    let mut home: Vec<roster::Saved> = Vec::new();
+    for saved in roster::load_all() {
+        if saved.present {
+            buddies.push(spawn_saved(&mut *plat, d, &world, &settings, &mut rng, saved));
+        } else {
+            home.push(saved);
+        }
+    }
+    if buddies.is_empty() {
+        let b = spawn_new(&mut *plat, d, &world, &settings, &mut rng, &buddies, &home);
+        buddies.push(b);
+    }
+    update_tray(&mut *plat, &settings, buddies.len());
+    let mut tray_count = buddies.len();
+
     // Each window's program (looked up once per window).
-    let mut exes: std::collections::HashMap<WinId, String> = std::collections::HashMap::new();
+    let mut exes: HashMap<WinId, String> = HashMap::new();
     let mut page_scan = 0.0f32;
-    // Page scrolling predicted from the mouse wheel, still to be applied
-    // (px, + = page content moving down), and when the wheel last turned.
-    let mut scroll: std::collections::HashMap<WinId, f32> = std::collections::HashMap::new();
+    // The page box being followed closely in each window: (its key, when asked).
+    let mut tracking: HashMap<WinId, (u32, Instant)> = HashMap::new();
     // Desktop icons in their real order (index = what Explorer calls them),
     // and icons currently flying after being kicked.
     let mut icon_list: Vec<(String, Rect)> = Vec::new();
     let mut flights: Vec<IconFlight> = Vec::new();
-    // What it did and whether you reacted (only kept with "Learn what I like").
-    let mut logger = learn::Logger::default();
-    let mut last_wheel: std::collections::HashMap<WinId, Instant> = std::collections::HashMap::new();
     let mut icon_scan = 0.0f32;
-    let mut peers = Peers::new();
     let mut watcher = Watcher::default();
     let mut helper = Helper::new(&mut rng);
     // Turned off for the rest of the session if the game code ever panics.
     let mut games_ok = true;
-
-    let spawn = v2(world.work.l + world.work.width() * rng.range(0.2, 0.8), world.work.t + 80.0 * s);
-    let mut settings = Settings::load();
-    let mut style = Style::new(settings.color, settings.outline);
-    let mut man = Stickman::new(d, spawn);
-    man.force_front = settings.stay_in_front;
-    man.allow_cursor = settings.grab_cursor;
-    man.gravity = settings.gravity;
-    man.move_icons = settings.move_icons;
-    let mut brain = UtilityBrain::new(Personality::random(&mut rng));
+    // Which stickman is helping with Minesweeper.
+    let mut sweeper_id: Option<u32> = None;
 
     let size = ((190.0 * s).ceil() as u32).max(64);
     let mut pixmap = tiny_skia::Pixmap::new(size, size).expect("pixmap");
@@ -296,39 +434,42 @@ fn main() {
     let mut scan = 0.0f32;
     let mut door_scan = 0.0f32;
     let mut topmost = 0.0f32;
+    let mut autosave = AUTOSAVE;
     let mut last_cursor = plat.cursor();
-    let mut body_hit_cooldown = 0.0f32;
 
     'run: loop {
         let frame_start = Instant::now();
 
         for ev in plat.poll_events() {
-            // A command from the right-click menu (value -1 = toggle) or the
-            // settings panel (value = new checkbox state / dropdown index).
+            // A command from a menu (value -1 = toggle) or the settings
+            // panel (value = new checkbox state / dropdown index).
             let (id, value) = match ev {
                 Event::Quit => break 'run,
-                Event::MouseDown => {
-                    man.grab(plat.cursor());
-                    brain.notify(BrainEvent::Grabbed);
-                    logger.engaged(1.0);
-                    continue;
-                }
-                Event::MouseUp => {
-                    if man.release(&world) {
-                        brain.notify(BrainEvent::Thrown);
+                Event::MouseDown { slot } => {
+                    let c = plat.cursor();
+                    if let Some(b) = buddies.iter_mut().find(|b| b.slot == slot) {
+                        b.man.grab(c);
+                        b.brain.notify(BrainEvent::Grabbed);
+                        b.attention = (b.attention + 0.5).min(1.0);
                     }
                     continue;
                 }
-                Event::RightClick => {
-                    // Kept short: everything else is in the settings panel.
-                    let items = [
-                        MenuItem::new(MENU_LIMP, "Ragdoll", false),
-                        MenuItem::new(MENU_COME, "Come here", false),
+                Event::MouseUp { slot } => {
+                    if let Some(b) = buddies.iter_mut().find(|b| b.slot == slot) {
+                        if b.man.release(&world) {
+                            b.brain.notify(BrainEvent::Thrown);
+                        }
+                    }
+                    continue;
+                }
+                Event::RightClick { slot } => {
+                    let Some(b) = buddies.iter().find(|b| b.slot == slot) else { continue };
+                    let mut items = b.menu();
+                    items.extend([
                         MenuItem::separator(),
                         MenuItem::new(MENU_SETTINGS, "Settings...", false),
-                        MenuItem::separator(),
-                        MenuItem::new(MENU_QUIT, "Quit", false),
-                    ];
+                        MenuItem::new(MENU_QUIT, "Quit (everyone's saved)", false),
+                    ]);
                     let picked = plat.show_menu(&items);
                     // The menu blocks; don't simulate the time it was open.
                     last = Instant::now();
@@ -337,36 +478,121 @@ fn main() {
                         None => continue,
                     }
                 }
-                Event::Setting { id, value } => (id, value),
-                Event::Wheel { at, notches } => {
-                    // Scrolling a page it's on (or near): move the page's
-                    // boxes straight away instead of waiting for a re-read.
-                    if let Some(id) = world.window_at(at) {
-                        if world.pages.iter().any(|p| p.win == id) {
-                            let exe = exes.get(&id).map(String::as_str).unwrap_or("");
-                            *scroll.entry(id).or_insert(0.0) += notches * scroll_step(exe) * plat.dpi_scale();
-                            last_wheel.insert(id, Instant::now());
-                        }
+                Event::Tray => {
+                    // Everyone, in one place.
+                    let mut items: Vec<MenuItem> = buddies
+                        .iter()
+                        .map(|b| {
+                            let mut sub = b.menu();
+                            sub.push(MenuItem::new(MENU_BUDDY + b.slot as u32 * 10 + B_FORGET, "Forget forever...", false));
+                            MenuItem::submenu(&b.name, sub)
+                        })
+                        .collect();
+                    items.push(MenuItem::new(MENU_ADD, "Add a stickman", false));
+                    if !home.is_empty() {
+                        let back = home
+                            .iter()
+                            .enumerate()
+                            .map(|(i, h)| MenuItem::new(MENU_BRING + i as u32, &h.name, false))
+                            .collect();
+                        items.push(MenuItem::submenu("Bring back", back));
                     }
-                    continue;
+                    items.extend([
+                        MenuItem::separator(),
+                        MenuItem::new(MENU_PAUSE, "Pause everyone", paused),
+                        MenuItem::new(MENU_SETTINGS, "Settings...", false),
+                        MenuItem::separator(),
+                        MenuItem::new(MENU_QUIT, "Quit (everyone's saved)", false),
+                    ]);
+                    let picked = plat.show_menu(&items);
+                    last = Instant::now();
+                    match picked {
+                        Some(id) => (id, -1),
+                        None => continue,
+                    }
                 }
+                Event::Setting { id, value } => (id, value),
             };
             let flag = |current: bool| if value < 0 { !current } else { value != 0 };
-            match id {
-                MENU_LIMP => man.go_limp(),
-                MENU_COME => {
-                    let c = plat.cursor();
-                    man.teleport(c - v2(0.0, 40.0 * s));
+
+            // One stickman's own commands.
+            if (MENU_BUDDY..MENU_BRING).contains(&id) {
+                let (slot, code) = (((id - MENU_BUDDY) / 10) as usize, (id - MENU_BUDDY) % 10);
+                let Some(i) = buddies.iter().position(|b| b.slot == slot) else { continue };
+                match code {
+                    B_LIMP => buddies[i].man.go_limp(),
+                    B_COME => {
+                        let c = plat.cursor();
+                        buddies[i].man.teleport(c - v2(0.0, 40.0 * s));
+                    }
+                    B_COLOR => {
+                        if let Some(c) = plat.pick_color(buddies[i].color) {
+                            buddies[i].color = c;
+                            buddies[i].style = Style::new(c, settings.outline);
+                            roster::save(&buddies[i].saved(true));
+                        }
+                        last = Instant::now();
+                    }
+                    B_GOOD | B_BAD => {
+                        // Teaching: what it's doing right now gets the credit
+                        // (or the blame), and counts extra.
+                        let v = if code == B_GOOD { 1.0 } else { -1.0 };
+                        buddies[i].brain.notify(BrainEvent::Teach(v));
+                        buddies[i].man.interrupt();
+                    }
+                    B_HOME => {
+                        let b = buddies.remove(i);
+                        let saved = b.saved(false);
+                        roster::save(&saved);
+                        home.push(saved);
+                        plat.destroy_overlay(b.slot);
+                    }
+                    B_FORGET => {
+                        let text = format!("Forget {} forever? Everything it has learned will be lost.", buddies[i].name);
+                        if plat.confirm(&text) {
+                            let b = buddies.remove(i);
+                            roster::forget(b.id);
+                            plat.destroy_overlay(b.slot);
+                            for other in buddies.iter_mut() {
+                                other.brain.forget(b.id);
+                            }
+                        }
+                        last = Instant::now();
+                    }
+                    _ => {}
                 }
-                MENU_SETTINGS => plat.open_settings(&settings_items(&settings, &man, paused)),
+                continue;
+            }
+            if id >= MENU_BRING {
+                let i = (id - MENU_BRING) as usize;
+                if i < home.len() {
+                    let mut saved = home.remove(i);
+                    saved.present = true;
+                    roster::save(&saved);
+                    let b = spawn_saved(&mut *plat, d, &world, &settings, &mut rng, saved);
+                    buddies.push(b);
+                }
+                continue;
+            }
+            match id {
+                MENU_SETTINGS => plat.open_settings(&settings_items(&settings, paused)),
+                MENU_ADD => {
+                    let b = spawn_new(&mut *plat, d, &world, &settings, &mut rng, &buddies, &home);
+                    roster::save(&b.saved(true));
+                    buddies.push(b);
+                }
                 MENU_FRONT => {
-                    man.force_front = flag(man.force_front);
-                    settings.stay_in_front = man.force_front;
+                    settings.stay_in_front = flag(settings.stay_in_front);
+                    for b in buddies.iter_mut() {
+                        b.man.force_front = settings.stay_in_front;
+                    }
                     settings.save();
                 }
                 MENU_CURSOR => {
-                    man.allow_cursor = flag(man.allow_cursor);
-                    settings.grab_cursor = man.allow_cursor;
+                    settings.grab_cursor = flag(settings.grab_cursor);
+                    for b in buddies.iter_mut() {
+                        b.man.allow_cursor = settings.grab_cursor;
+                    }
                     settings.save();
                 }
                 MENU_ICONS => {
@@ -379,7 +605,9 @@ fn main() {
                 }
                 MENU_MOVE_ICONS => {
                     settings.move_icons = flag(settings.move_icons);
-                    man.move_icons = settings.move_icons;
+                    for b in buddies.iter_mut() {
+                        b.man.move_icons = settings.move_icons;
+                    }
                     settings.save();
                 }
                 MENU_LEARN => {
@@ -390,14 +618,16 @@ fn main() {
                 MENU_COLOR => {
                     if let Some(c) = plat.pick_color(settings.color) {
                         settings.color = c;
-                        style = Style::new(c, settings.outline);
                         settings.save();
+                        update_tray(&mut *plat, &settings, buddies.len());
                     }
                     last = Instant::now();
                 }
                 MENU_OUTLINE => {
                     settings.outline = flag(settings.outline);
-                    style = Style::new(settings.color, settings.outline);
+                    for b in buddies.iter_mut() {
+                        b.style = Style::new(b.color, settings.outline);
+                    }
                     settings.save();
                 }
                 MENU_MS_HELP => {
@@ -430,7 +660,9 @@ fn main() {
                 MENU_GRAVITY => {
                     if let Some((_, g)) = GRAVITY_PRESETS.get(value.max(0) as usize) {
                         settings.gravity = *g;
-                        man.gravity = settings.gravity;
+                        for b in buddies.iter_mut() {
+                            b.man.gravity = settings.gravity;
+                        }
                         settings.save();
                     }
                 }
@@ -442,6 +674,19 @@ fn main() {
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f32().min(0.1);
         last = now;
+
+        // Someone ran stickman.exe again: one more stickman.
+        if let Some(h) = &host {
+            for _ in 0..h.poll().min(4) {
+                let b = spawn_new(&mut *plat, d, &world, &settings, &mut rng, &buddies, &home);
+                roster::save(&b.saved(true));
+                buddies.push(b);
+            }
+        }
+        if tray_count != buddies.len() {
+            tray_count = buddies.len();
+            update_tray(&mut *plat, &settings, tray_count);
+        }
 
         // Desktop icons to climb and swing on (read in the background).
         if settings.desktop_icons {
@@ -469,32 +714,39 @@ fn main() {
             // Games opening, being won or lost.
             let events = guarded(&mut games_ok, || watcher.update(&*plat, &world)).unwrap_or_default();
             for e in events {
-                if matches!(e, GameEvent::Finished(..)) {
-                    man.interrupt();
+                for b in buddies.iter_mut() {
+                    if matches!(e, GameEvent::Finished(..)) {
+                        b.man.interrupt();
+                    }
+                    b.brain.notify(BrainEvent::Game(e));
                 }
-                brain.notify(BrainEvent::Game(e));
             }
         } else {
-            if let Some(id) = man.attached_window() {
-                world.set_window_rect(id, plat.window_rect(id));
-            }
-            // The foreground window is the one being dragged around: track it
-            // every frame.
-            if let Some(id) = world.windows.first().map(|w| w.id) {
+            // The windows they're attached to, and the one in front (it's
+            // the one being dragged around), are tracked every frame.
+            let mut live: Vec<WinId> = buddies.iter().filter_map(|b| b.man.attached_window()).collect();
+            live.extend(world.windows.first().map(|w| w.id));
+            live.sort_unstable();
+            live.dedup();
+            for id in live {
                 world.set_window_rect(id, plat.window_rect(id));
             }
         }
-        // Any window that moved can shove or squash the stickman.
+        // Any window that moved can shove or squash them.
         for (id, old) in before {
             if let Some(new) = world.window(id).map(|w| w.rect) {
-                if new != old && Some(id) != man.attached_window() {
-                    man.shove(&world, id, old, new, dt);
+                if new != old {
+                    for b in buddies.iter_mut() {
+                        if Some(id) != b.man.attached_window() {
+                            b.man.shove(&world, id, old, new, dt);
+                        }
+                    }
                 }
             }
         }
 
-        // Which taskbar button leads to which window (it only ever dives
-        // into a real app button, for the window it's heading to).
+        // Which taskbar button leads to which window (they only ever dive
+        // into a real app button, for the window they're heading to).
         door_scan -= dt;
         if door_scan <= 0.0 {
             door_scan = DOOR_SCAN;
@@ -522,125 +774,135 @@ fn main() {
         let foreground = plat.foreground();
         let focus_game = foreground.filter(|id| watcher.game_window(*id).is_some());
 
-        // Pages: the boxes on the web page (or in the app) it's inside, and in
-        // the browser you're using, become ledges it can stand on.
+        // Pages: the boxes on the web page (or in the app) someone is inside,
+        // and in the browser you're using, become ledges to stand on.
         page_scan -= dt;
         if !settings.web_pages {
             world.pages.clear();
-            scroll.clear();
+            for (id, _) in tracking.drain() {
+                plat.track(id, None);
+            }
         } else if page_scan <= 0.0 {
-            page_scan = 0.5;
+            page_scan = 0.4;
             exes.retain(|id, _| world.window(*id).is_some());
             for w in &world.windows {
                 exes.entry(w.id).or_insert_with(|| plat.window_process(w.id).map(|p| p.1).unwrap_or_default());
             }
-            let mut wanted: Vec<WinId> = Vec::new();
-            // Whatever window it's inside (any app), plus the browser in front.
-            if let Some(id) = man.room() {
-                wanted.push(id);
-            }
+            // Whatever window anyone is inside (any app), plus the browser in front.
+            let mut wanted: Vec<WinId> = buddies.iter().filter_map(|b| b.man.room()).collect();
             if let Some(id) = foreground {
-                if exes.get(&id).is_some_and(|e| has_web_content(e)) && !wanted.contains(&id) {
+                if exes.get(&id).is_some_and(|e| has_web_content(e)) {
                     wanted.push(id);
                 }
             }
+            wanted.sort_unstable();
+            wanted.dedup();
             let mut pages = Vec::new();
             for id in wanted {
                 let current = world.pages.iter().find(|p| p.win == id).cloned();
-                let fresh = plat.page_boxes(id).filter(|(_, _, age)| *age < 10.0);
-                let page = match fresh {
-                    Some((doc, boxes, age)) => {
-                        // Read before the scrolling settled? Then it's older
-                        // than what we've predicted: keep the prediction.
-                        let taken = Instant::now().checked_sub(Duration::from_secs_f32(age));
-                        let settled = last_wheel.get(&id).map(|w| *w + Duration::from_millis(400));
-                        let outdated = matches!((taken, settled), (Some(t), Some(w)) if t < w);
-                        if outdated && current.is_some() {
-                            current
-                        } else {
-                            scroll.remove(&id);
-                            Some(Page { win: id, doc, ledges: page_ledges(doc, &boxes, s) })
-                        }
-                    }
-                    None => current,
+                let page = match plat.page_boxes(id) {
+                    // A newer read: lay the page out afresh.
+                    Some(snap) if current.as_ref().map_or(true, |c| snap.taken > c.taken) => Some(Page {
+                        win: id,
+                        doc: snap.doc,
+                        ledges: page_ledges(snap.doc, &snap.boxes, s),
+                        taken: snap.taken,
+                        probe: snap.probe,
+                        shift: 0.0,
+                    }),
+                    _ => current,
                 };
                 pages.extend(page);
             }
             world.pages = pages;
-        }
-        // Play out predicted scrolling smoothly (like the browser does).
-        for (id, pending) in scroll.iter_mut() {
-            if pending.abs() < 0.1 {
-                continue;
+            // Stop following boxes on pages nobody's on any more.
+            let gone: Vec<WinId> = tracking.keys().copied().filter(|id| !world.pages.iter().any(|p| p.win == *id)).collect();
+            for id in gone {
+                tracking.remove(&id);
+                plat.track(id, None);
             }
-            let step = *pending * (1.0 - (-dt * 14.0).exp());
-            *pending -= step;
-            if let Some(page) = world.pages.iter_mut().find(|p| p.win == *id) {
-                for r in &mut page.ledges {
-                    r.t += step;
-                    r.b += step;
+        }
+        // Scrolling: the box being followed closely tells us exactly how far
+        // the page has moved, whatever moved it (wheel, touchpad, scrollbar,
+        // keys). Only real movement of the boxes counts, so it never floats
+        // off when something that doesn't scroll is under it.
+        for page in world.pages.iter_mut() {
+            if let (Some((g0, top0)), Some((g, top, at))) = (page.probe, plat.page_probe(page.win)) {
+                if g == g0 && at > page.taken && (top - top0).abs() >= 0.5 {
+                    page.scroll_by(top - top0);
+                    page.probe = Some((g0, top));
                 }
+            }
+        }
+        // Follow the box each stickman is standing on (one per page).
+        for page in &world.pages {
+            let standing = buddies.iter().find_map(|b| match b.man.mode {
+                Mode::Ground(Support::Ledge { win, key }) if win == page.win => {
+                    world.ledge(win, key, Some(b.man.pos.y + b.man.d.stance))
+                }
+                _ => None,
+            });
+            let Some(r) = standing else { continue };
+            let key = ledge_key(&r);
+            let stale = match tracking.get(&page.win) {
+                Some((k, asked)) => *k != key || (asked.elapsed() > Duration::from_millis(700) && page.probe.is_none()),
+                None => true,
+            };
+            if stale {
+                // In the coordinates of the last read.
+                let at = Rect { t: r.t - page.shift, b: r.b - page.shift, ..r };
+                plat.track(page.win, Some(at));
+                tracking.insert(page.win, (key, Instant::now()));
             }
         }
 
-        // Other stickmen: share our state, get knocked over (or woken) by theirs.
-        let me = Me {
-            hip: man.center(),
-            vel: man.vel,
-            ragdoll: man.is_ragdoll(),
-            sleeping: man.is_sleeping(),
-            body: man.body_rect(),
-        };
-        for msg in peers.update(dt, &me) {
-            match msg {
-                Incoming::Hit { from, impulse } => {
-                    man.knock(impulse);
-                    brain.notify(BrainEvent::Hit { from });
-                }
-                Incoming::Poke { from } => {
-                    if man.is_sleeping() {
-                        man.interrupt();
-                        brain.notify(BrainEvent::Poked { from });
+        // Everyone's bodies this frame: (id, box, ragdoll, hip, sleeping).
+        let bodies: Vec<(u32, Rect, bool, Vec2, bool)> =
+            buddies.iter().map(|b| (b.id, b.man.body_rect(), b.man.is_ragdoll(), b.man.center(), b.man.is_sleeping())).collect();
+
+        // Thrown or flying fast into another stickman bowls it over (and the
+        // hit slows the thrown one down).
+        let mut hits: Vec<(u32, u32, Vec2)> = Vec::new();
+        for b in buddies.iter_mut() {
+            b.body_hit_cooldown -= dt;
+            let flying = b.man.is_ragdoll() || b.man.mode == Mode::Air;
+            if flying && b.body_hit_cooldown <= 0.0 && b.man.vel.len() > 600.0 * s {
+                let mine = b.man.body_rect();
+                let struck: Vec<u32> =
+                    bodies.iter().filter(|o| o.0 != b.id && !o.2 && o.1.overlaps(&mine)).map(|o| o.0).collect();
+                if !struck.is_empty() {
+                    for to in struck {
+                        hits.push((b.id, to, b.man.vel * 0.55));
                     }
+                    b.man.bounce(b.man.vel * -0.35);
+                    b.body_hit_cooldown = 0.5;
                 }
             }
-        }
-        // Their bodies, for standing on and piling up on.
-        world.peers = peers.list.iter().map(|p| PeerBody { id: p.id, rect: p.body, ragdoll: p.ragdoll }).collect();
-        // A random impulse takes over whatever it's doing (but lets it sleep).
-        if brain.whim_due() && !man.is_sleeping() {
-            man.interrupt();
-        }
-
-        // Thrown or flying fast into another stickman bowls it over (and
-        // the hit slows us down).
-        body_hit_cooldown -= dt;
-        let flying = man.is_ragdoll() || man.mode == Mode::Air;
-        if flying && body_hit_cooldown <= 0.0 && man.vel.len() > 600.0 * s {
-            let mine = man.body_rect();
-            let hit: Vec<u32> = peers.list.iter().filter(|p| !p.ragdoll && p.body.overlaps(&mine)).map(|p| p.id).collect();
-            if !hit.is_empty() {
-                for id in hit {
-                    peers.send_hit(id, man.vel * 0.55);
-                }
-                man.bounce(man.vel * -0.35);
-                body_hit_cooldown = 0.5;
+            // A random impulse takes over whatever it's doing (but lets it sleep).
+            if b.brain.whim_due() && !b.man.is_sleeping() {
+                b.man.interrupt();
             }
         }
 
-        // Helping with Minesweeper while you play it (the game it's working on).
-        let mut sweeper: Option<(WinId, Look)> = None;
+        // Helping with Minesweeper while you play it (one of them does it).
+        let mut sweeper: Option<(u32, Look)> = None;
         if settings.minesweeper_help && !paused && games_ok {
             if let Some((id, game)) = watcher.find(Game::is_minesweeper) {
-                if foreground == Some(id) {
+                if foreground == Some(id) && !buddies.is_empty() {
                     let look = look_of(game);
-                    sweeper = Some((id, look));
-                    let ready = man.can_help();
+                    let who = sweeper_id
+                        .and_then(|w| buddies.iter().position(|b| b.id == w))
+                        .or_else(|| buddies.iter().position(|b| b.man.can_help()))
+                        .unwrap_or(0);
+                    let b = &mut buddies[who];
+                    sweeper_id = Some(b.id);
+                    sweeper = Some((b.id, look));
+                    let ready = b.man.can_help();
                     let mistakes = settings.minesweeper_mistakes;
                     let target =
                         guarded(&mut games_ok, || helper.update(dt, &mut *plat, id, look, ready, mistakes, &mut rng)).flatten();
                     if let Some(at) = target {
-                        if !man.stomp(at, id) {
+                        if !b.man.stomp(at, id) {
                             helper.cancel();
                         }
                     }
@@ -651,74 +913,146 @@ fn main() {
         acc = (acc + dt).min(0.25);
         while acc >= STEP {
             acc -= STEP;
-            if !paused && man.wants_intent() {
-                let views = peers
-                    .list
-                    .iter()
-                    .map(|p| PeerView { id: p.id, hip: p.hip, ragdoll: p.ragdoll, sleeping: p.sleeping, ground: p.body.b })
-                    .collect();
-                if let Some(p) = man.perceive(cursor, views, focus_game) {
-                    let intent = brain.decide(&p, &world, &mut rng);
-                    man.apply(intent, &world);
-                    if let Some((kind, x)) = brain.take_choice() {
-                        if settings.learn {
-                            logger.chose(kind, x);
+            let mut pokes: Vec<(u32, u32)> = Vec::new();
+            let mut fives: Vec<(u32, u32)> = Vec::new();
+            for i in 0..buddies.len() {
+                let me = buddies[i].id;
+                // Everyone else, as this one sees them.
+                world.peers = bodies.iter().filter(|o| o.0 != me).map(|o| PeerBody { id: o.0, rect: o.1, ragdoll: o.2 }).collect();
+                let b = &mut buddies[i];
+                if !paused && b.man.wants_intent() {
+                    let views = bodies
+                        .iter()
+                        .filter(|o| o.0 != me)
+                        .map(|o| PeerView { id: o.0, hip: o.3, ragdoll: o.2, sleeping: o.4, ground: o.1.b })
+                        .collect();
+                    if let Some(mut p) = b.man.perceive(cursor, views, focus_game) {
+                        let span = (world.primary.b - world.primary.t).max(1.0);
+                        p.height = ((world.primary.b - p.foot.y) / span).clamp(0.0, 1.0);
+                        p.attention = b.attention;
+                        let intent = b.brain.decide(&p, &world, &mut rng);
+                        b.man.apply(intent, &world);
+                        if let Some(e) = b.brain.take_experience() {
+                            if settings.learn {
+                                learn::log(&e);
+                            }
+                        }
+                    }
+                }
+                b.brain.tick(STEP);
+                let ev = b.man.update(STEP, &world, cursor, cursor_vel);
+                if let Some(impact) = ev.landed {
+                    b.brain.notify(BrainEvent::Landed(impact));
+                }
+                if let Some((target, impulse, range)) = ev.hit {
+                    if let Some(o) = bodies.iter().find(|o| o.0 == target) {
+                        if (o.3 - b.man.pos).len() < range {
+                            hits.push((me, target, impulse));
+                        }
+                    }
+                }
+                // Kicked a desktop icon: send it flying.
+                if let Some((at, dir)) = ev.kicked {
+                    if settings.move_icons && settings.desktop_icons {
+                        let hit = icon_list.iter().position(|(_, r)| {
+                            at.x > r.l - 10.0 * s && at.x < r.r + 10.0 * s && at.y > r.t - 10.0 * s && at.y < r.b + 10.0 * s
+                        });
+                        if let Some(index) = hit {
+                            let (name, r) = &icon_list[index];
+                            if !flights.iter().any(|f| f.index == index) {
+                                flights.push(IconFlight {
+                                    index,
+                                    key: icon_key(name),
+                                    pos: v2(r.l, r.t),
+                                    vel: v2(dir * 700.0, -420.0) * s,
+                                    size: v2(r.r - r.l, r.b - r.t),
+                                    age: 0.0,
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(target) = ev.poke {
+                    pokes.push((me, target));
+                }
+                if let Some(target) = ev.high_five {
+                    fives.push((me, target));
+                }
+                if ev.stomped {
+                    match sweeper {
+                        Some((who, look)) if who == me => {
+                            guarded(&mut games_ok, || helper.stomped(&mut *plat, look, &mut rng));
+                        }
+                        _ => helper.cancel(),
+                    }
+                }
+            }
+
+            // What they did to each other.
+            for (from, to, impulse) in hits.drain(..) {
+                let victim_at = bodies.iter().find(|o| o.0 == to).map(|o| o.3);
+                for b in buddies.iter_mut() {
+                    if b.id == to {
+                        b.man.knock(impulse);
+                        b.brain.notify(BrainEvent::Hit { from });
+                    } else if b.id != from {
+                        // Bystanders see it, and may take sides.
+                        if victim_at.is_some_and(|v| (v - b.man.center()).len() < 600.0 * s) {
+                            b.brain.notify(BrainEvent::Saw { attacker: from, victim: to });
                         }
                     }
                 }
             }
-            brain.tick(STEP);
-            let ev = man.update(STEP, &world, cursor, cursor_vel);
-            if let Some(impact) = ev.landed {
-                brain.notify(BrainEvent::Landed(impact));
-            }
-            if let Some((target, impulse, range)) = ev.hit {
-                if let Some(peer) = peers.get(target) {
-                    if (peer.hip - man.pos).len() < range {
-                        peers.send_hit(target, impulse);
+            for (from, to) in pokes {
+                if let Some(b) = buddies.iter_mut().find(|b| b.id == to) {
+                    if b.man.is_sleeping() {
+                        b.man.interrupt();
+                        b.brain.notify(BrainEvent::Poked { from });
                     }
                 }
             }
-            // Kicked a desktop icon: send it flying.
-            if let Some((at, dir)) = ev.kicked {
-                if settings.move_icons && settings.desktop_icons {
-                    let hit = icon_list.iter().position(|(_, r)| {
-                        at.x > r.l - 10.0 * s && at.x < r.r + 10.0 * s && at.y > r.t - 10.0 * s && at.y < r.b + 10.0 * s
-                    });
-                    if let Some(index) = hit {
-                        let (name, r) = &icon_list[index];
-                        if !flights.iter().any(|f| f.index == index) {
-                            flights.push(IconFlight {
-                                index,
-                                key: icon_key(name),
-                                pos: v2(r.l, r.t),
-                                vel: v2(dir * 700.0, -420.0) * s,
-                                size: v2(r.r - r.l, r.b - r.t),
-                                age: 0.0,
-                            });
-                        }
+            for (from, to) in fives {
+                let mut answered = false;
+                if let Some(b) = buddies.iter_mut().find(|b| b.id == to) {
+                    if b.man.is_free() {
+                        b.brain.notify(BrainEvent::HighFived { from });
+                        b.man.interrupt();
+                        answered = true;
                     }
                 }
-            }
-            if let Some(target) = ev.poke {
-                peers.send_poke(target);
-            }
-            if ev.stomped {
-                match sweeper {
-                    Some((_, look)) => {
-                        guarded(&mut games_ok, || helper.stomped(&mut *plat, look, &mut rng));
+                if answered {
+                    if let Some(b) = buddies.iter_mut().find(|b| b.id == from) {
+                        b.brain.notify(BrainEvent::GaveHighFive { to });
                     }
-                    None => helper.cancel(),
                 }
             }
         }
+        world.peers = bodies.iter().map(|o| PeerBody { id: o.0, rect: o.1, ragdoll: o.2 }).collect();
 
-        // Learning: hovering your mouse near it counts as paying attention.
-        if settings.learn {
-            if (cursor - man.center()).len() < 150.0 * s {
-                logger.engaged(dt * 0.6);
+        for b in buddies.iter_mut() {
+            // You paying attention: hovering nearby...
+            let c = b.man.center();
+            b.attention = (b.attention - dt * 0.05).max(0.0);
+            if (cursor - c).len() < 150.0 * s {
+                b.attention = (b.attention + dt * 0.3).min(1.0);
+                b.brain.notify(BrainEvent::Attention(dt * 0.15));
             }
-            logger.tick();
+            // ...or stroking it: the cursor moving gently over its head.
+            let head = b.man.pose().head;
+            let speed = cursor_vel.len();
+            if !b.man.is_ragdoll() && (cursor - head).len() < 20.0 * s && speed > 60.0 * s && speed < 900.0 * s {
+                b.pet += dt;
+            } else {
+                b.pet = (b.pet - dt * 0.5).max(0.0);
+            }
+            if b.pet > 0.8 {
+                b.pet = 0.0;
+                b.brain.notify(BrainEvent::Petted);
+            }
+            // How it feels comes out as body language.
+            if let Some(f) = b.brain.take_feeling() {
+                b.man.express(f);
+            }
         }
 
         // Kicked icons flying across the desktop.
@@ -742,30 +1076,41 @@ fn main() {
             }
         }
 
-        let center = man.center();
-        let origin = v2((center.x - size as f32 * 0.5).floor(), (center.y - size as f32 * 0.55).floor());
-        if man.hidden() {
-            pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        } else {
-            render::draw(&mut pixmap, &man.pose(), origin, &d, &style, man.zzz());
+        for b in &buddies {
+            let center = b.man.center();
+            let origin = v2((center.x - size as f32 * 0.5).floor(), (center.y - size as f32 * 0.55).floor());
+            if b.man.hidden() {
+                pixmap.fill(tiny_skia::Color::TRANSPARENT);
+            } else {
+                render::draw(&mut pixmap, &b.man.pose(), origin, &d, &b.style, b.man.zzz());
+            }
+            let mut occluders = world.occluders(b.man.layer);
+            // Diving into the taskbar: it covers them as they go in.
+            if b.man.in_portal() {
+                if let Some(tb) = world.taskbar {
+                    occluders.push(tb.rect);
+                }
+            }
+            // Up on a web page: it's *in* the page, so scrolling it out of
+            // view hides it behind the browser's toolbar (and below the page).
+            if b.man.in_page() {
+                if let Some(page) = world.pages.iter().find(|p| Some(p.win) == b.man.room()) {
+                    const FAR: f32 = 100_000.0;
+                    occluders.push(Rect { l: -FAR, t: -FAR, r: FAR, b: page.doc.t });
+                    occluders.push(Rect { l: -FAR, t: page.doc.b, r: FAR, b: FAR });
+                }
+            }
+            plat.present(b.slot, pixmap.data(), size, size, origin.x as i32, origin.y as i32, &occluders);
         }
-        let mut occluders = world.occluders(man.layer);
-        // Diving into the taskbar: it covers us as we go in.
-        if man.in_portal() {
-            if let Some(tb) = world.taskbar {
-                occluders.push(tb.rect);
+
+        // Saved now and then, in case of a crash or power cut.
+        autosave -= dt;
+        if autosave <= 0.0 {
+            autosave = AUTOSAVE;
+            for b in &buddies {
+                roster::save(&b.saved(true));
             }
         }
-        // Up on a web page: it's *in* the page, so scrolling it out of view
-        // hides it behind the browser's toolbar (and below the page).
-        if man.in_page() {
-            if let Some(page) = world.pages.iter().find(|p| Some(p.win) == man.room()) {
-                const FAR: f32 = 100_000.0;
-                occluders.push(Rect { l: -FAR, t: -FAR, r: FAR, b: page.doc.t });
-                occluders.push(Rect { l: -FAR, t: page.doc.b, r: FAR, b: FAR });
-            }
-        }
-        plat.present(pixmap.data(), size, size, origin.x as i32, origin.y as i32, &occluders);
 
         topmost -= dt;
         if topmost <= 0.0 {
@@ -773,11 +1118,17 @@ fn main() {
             topmost = 2.0;
         }
 
-        // ~60 fps while moving, ~30 fps while resting to save CPU.
-        let frame = Duration::from_millis(if man.is_resting() { 33 } else { 16 });
+        // ~60 fps while anyone's moving, ~30 fps while they all rest.
+        let resting = buddies.iter().all(|b| b.man.is_resting());
+        let frame = Duration::from_millis(if resting { 33 } else { 16 });
         let spent = frame_start.elapsed();
         if spent < frame {
             std::thread::sleep(frame - spent);
         }
+    }
+
+    // Closing: everyone out on the desktop is saved, and comes back next time.
+    for b in &buddies {
+        roster::save(&b.saved(true));
     }
 }

@@ -7,15 +7,15 @@
 //! background thread: the stickman never waits for it.
 
 use std::ffi::c_void;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Instant;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern, IUIAutomationTreeWalker,
-    TreeScope_Descendants, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
-    UIA_DocumentControlTypeId, UIA_InvokePatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationElementArray, IUIAutomationInvokePattern,
+    IUIAutomationTreeWalker, TreeScope_Descendants, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId,
+    UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_InvokePatternId,
 };
 
 use crate::math::{Rect, Vec2};
@@ -38,15 +38,42 @@ pub enum Request {
     Invoke(usize, String, Vec2),
     /// The desktop's icon list window: list the icons.
     Icons(usize),
+    /// Follow the box at this rect (as of the last page read) in this
+    /// window closely; None stops.
+    Track(usize, Option<Rect>),
 }
 
 pub enum Reply {
     Taskbar(Vec<(String, Rect)>),
     Elements(usize, Vec<Element>, Instant),
-    Page(usize, Option<PageBoxes>, Instant),
+    /// The page, when it was read, and where the followed box was then.
+    Page(usize, Option<PageBoxes>, Instant, Option<(u32, f32)>),
     InvokeFailed(usize, Vec2),
     Icons(Vec<(String, Rect)>),
+    /// The followed box moved: (window, which tracking, its top, when).
+    Probe(usize, u32, f32, Instant),
+    /// The followed box is gone.
+    ProbeLost(usize),
 }
+
+/// A box being followed closely (polled every few milliseconds).
+struct Probe {
+    hwnd: usize,
+    tracking: u32,
+    el: IUIAutomationElement,
+    top: f32,
+}
+
+/// The last page read in a window: the elements, and each box's index
+/// into them.
+struct LastPage {
+    hwnd: usize,
+    found: IUIAutomationElementArray,
+    boxes: Vec<(Rect, i32)>,
+}
+
+/// How often followed boxes are checked.
+const PROBE_EVERY: Duration = Duration::from_millis(15);
 
 const KINDS: usize = 4;
 
@@ -56,7 +83,7 @@ fn kind_of(r: &Request) -> Option<usize> {
         Request::Elements(_) => Some(1),
         Request::Page(_) => Some(2),
         Request::Icons(_) => Some(3),
-        Request::Invoke(..) => None,
+        Request::Invoke(..) | Request::Track(..) => None,
     }
 }
 
@@ -79,21 +106,96 @@ impl Worker {
             .name("ui-automation".into())
             .spawn(move || {
                 let Some(uia) = Uia::new() else { return };
-                while let Ok(req) = requests.recv() {
-                    let reply = match req {
-                        Request::Taskbar(h) => Reply::Taskbar(uia.taskbar_buttons(h as *mut c_void)),
-                        Request::Elements(h) => Reply::Elements(h, uia.elements(h as *mut c_void), Instant::now()),
-                        Request::Page(h) => Reply::Page(h, uia.page(h as *mut c_void), Instant::now()),
-                        Request::Invoke(h, prefix, at) => {
-                            if uia.invoke(h as *mut c_void, &prefix) {
-                                continue;
-                            }
-                            Reply::InvokeFailed(h, at)
+                let mut probes: Vec<Probe> = Vec::new();
+                let mut last_pages: Vec<LastPage> = Vec::new();
+                let mut tracking = 0u32;
+                loop {
+                    // Wait for work; while following boxes, only briefly.
+                    let req = if probes.is_empty() {
+                        match requests.recv() {
+                            Ok(r) => Some(r),
+                            Err(_) => break,
                         }
-                        Request::Icons(h) => Reply::Icons(uia.list_items(h as *mut c_void)),
+                    } else {
+                        match requests.recv_timeout(PROBE_EVERY) {
+                            Ok(r) => Some(r),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
                     };
-                    if replies.send(reply).is_err() {
-                        break;
+                    let reply = match req {
+                        None => None,
+                        Some(Request::Taskbar(h)) => Some(Reply::Taskbar(uia.taskbar_buttons(h as *mut c_void))),
+                        Some(Request::Elements(h)) => {
+                            Some(Reply::Elements(h, uia.elements(h as *mut c_void), Instant::now()))
+                        }
+                        Some(Request::Page(h)) => {
+                            let page = uia.page(h as *mut c_void);
+                            // Where the followed box is right now, to line
+                            // this read up with the live tracking.
+                            let probe = probes
+                                .iter()
+                                .find(|p| p.hwnd == h)
+                                .and_then(|p| unsafe { p.el.CurrentBoundingRectangle() }.ok().map(|r| (p.tracking, rect(r).t)));
+                            let taken = Instant::now();
+                            let boxes = page.as_ref().map(|(doc, boxes, _)| (*doc, boxes.clone()));
+                            last_pages.retain(|l| l.hwnd != h);
+                            if let Some((_, boxes, found)) = page {
+                                last_pages.push(LastPage { hwnd: h, found, boxes });
+                                if last_pages.len() > 4 {
+                                    last_pages.remove(0);
+                                }
+                            }
+                            Some(Reply::Page(h, boxes, taken, probe))
+                        }
+                        Some(Request::Invoke(h, prefix, at)) => {
+                            if uia.invoke(h as *mut c_void, &prefix) {
+                                None
+                            } else {
+                                Some(Reply::InvokeFailed(h, at))
+                            }
+                        }
+                        Some(Request::Icons(h)) => Some(Reply::Icons(uia.list_items(h as *mut c_void))),
+                        Some(Request::Track(h, target)) => {
+                            probes.retain(|p| p.hwnd != h);
+                            let found = target.and_then(|r| {
+                                let last = last_pages.iter().find(|l| l.hwnd == h)?;
+                                let el = closest_box(&last.boxes, r).and_then(|i| unsafe { last.found.GetElement(i as i32) }.ok())?;
+                                let top = rect(unsafe { el.CurrentBoundingRectangle() }.ok()?).t;
+                                Some((el, top))
+                            });
+                            match found {
+                                Some((el, top)) => {
+                                    tracking = tracking.wrapping_add(1);
+                                    probes.push(Probe { hwnd: h, tracking, el, top });
+                                    Some(Reply::Probe(h, tracking, top, Instant::now()))
+                                }
+                                None => Some(Reply::ProbeLost(h)),
+                            }
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        if replies.send(reply).is_err() {
+                            break;
+                        }
+                    }
+                    // Check the followed boxes: one cheap call each.
+                    let mut lost = Vec::new();
+                    for p in probes.iter_mut() {
+                        match unsafe { p.el.CurrentBoundingRectangle() } {
+                            Ok(r) => {
+                                let top = rect(r).t;
+                                if (top - p.top).abs() >= 0.5 {
+                                    p.top = top;
+                                    let _ = replies.send(Reply::Probe(p.hwnd, p.tracking, top, Instant::now()));
+                                }
+                            }
+                            Err(_) => lost.push(p.hwnd),
+                        }
+                    }
+                    for h in lost {
+                        probes.retain(|p| p.hwnd != h);
+                        let _ = replies.send(Reply::ProbeLost(h));
                     }
                 }
             })
@@ -121,7 +223,7 @@ impl Worker {
             Reply::Elements(..) => Some(1),
             Reply::Page(..) => Some(2),
             Reply::Icons(_) => Some(3),
-            Reply::InvokeFailed(..) => None,
+            Reply::InvokeFailed(..) | Reply::Probe(..) | Reply::ProbeLost(_) => None,
         };
         if let Some(k) = k {
             self.pending[k] = false;
@@ -140,6 +242,19 @@ const MAX_DEPTH: u32 = 10;
 
 fn rect(r: windows::Win32::Foundation::RECT) -> Rect {
     Rect { l: r.left as f32, t: r.top as f32, r: r.right as f32, b: r.bottom as f32 }
+}
+
+/// The box (index) that best matches a ledge: same top, most overlap.
+fn closest_box(boxes: &[(Rect, i32)], target: Rect) -> Option<usize> {
+    boxes
+        .iter()
+        .enumerate()
+        .filter(|(_, (b, _))| (b.t - target.t).abs() < 6.0 && b.r > target.l && b.l < target.r)
+        .min_by(|(_, (a, _)), (_, (b, _))| {
+            let score = |r: &Rect| (r.t - target.t).abs() * 4.0 + (r.l - target.l).abs() + (r.r - target.r).abs();
+            score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
 }
 
 pub struct Uia {
@@ -310,8 +425,9 @@ impl Uia {
     }
 
     /// The boxes on the web page shown in a browser window, fetched in one
-    /// go (much faster than asking element by element).
-    pub fn page(&self, hwnd: *mut c_void) -> Option<PageBoxes> {
+    /// go (much faster than asking element by element). Also returns the
+    /// elements themselves, so one can be followed closely later.
+    pub fn page(&self, hwnd: *mut c_void) -> Option<(Rect, Vec<(Rect, i32)>, IUIAutomationElementArray)> {
         unsafe {
             // The page itself (the biggest "document" in the window). Apps
             // without one (media players, games...) use the whole window.
@@ -329,13 +445,17 @@ impl Uia {
             let all = self.auto.CreateTrueCondition().ok()?;
             let found = doc.FindAllBuildCache(TreeScope_Descendants, &all, &cache).ok()?;
             let n = found.Length().ok()?.min(6000);
+            // Index i here is element i in `found` (unreadable ones get an
+            // empty box, so the numbering stays right).
             let mut boxes = Vec::with_capacity(n as usize);
             for i in 0..n {
-                let Ok(el) = found.GetElement(i) else { continue };
-                let (Ok(r), Ok(t)) = (el.CachedBoundingRectangle(), el.CachedControlType()) else { continue };
-                boxes.push((rect(r), t.0));
+                let b = found
+                    .GetElement(i)
+                    .ok()
+                    .and_then(|el| Some((rect(el.CachedBoundingRectangle().ok()?), el.CachedControlType().ok()?.0)));
+                boxes.push(b.unwrap_or((Rect { l: 0.0, t: 0.0, r: 0.0, b: 0.0 }, 0)));
             }
-            Some((doc_rect, boxes))
+            Some((doc_rect, boxes, found))
         }
     }
 

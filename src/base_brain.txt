@@ -1,0 +1,3 @@
+# Not trained yet. GitHub Actions replaces this file before every build by
+# running `python training/train.py pretrain`. Without it, stickmen start
+# with a blank brain and learn everything themselves.

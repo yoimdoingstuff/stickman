@@ -7,7 +7,7 @@ use std::f32::consts::{PI, TAU};
 use crate::brain::{Intent, PeerView, Perception};
 use crate::math::*;
 use crate::ragdoll::{Ragdoll, FOOT, HAND};
-use crate::rig::{Gesture, Pose, Rig, RigInput, RigState, WalkStyle};
+use crate::rig::{Feeling, Gesture, Pose, Rig, RigInput, RigState, WalkStyle};
 use crate::rng::Rng;
 use crate::world::*;
 
@@ -108,6 +108,8 @@ enum Action {
     /// `soft`: a poke to wake someone up rather than a real punch.
     Punch { t: f32, target: u32, dir: f32, fired: bool, soft: bool },
     Kick { t: f32, target: Option<u32>, dir: f32, fired: bool },
+    /// Hand up, slap a friend's hand.
+    HighFive { t: f32, target: u32, dir: f32, fired: bool },
     /// Walk to a ledge, then sit on it facing the drop.
     EdgeSit { t: f32, edge: f32, dir: f32 },
     /// Lying perfectly still... until your cursor gets close.
@@ -149,6 +151,8 @@ pub struct Events {
     pub poke: Option<u32>,
     /// A kick connected here, in this direction (for kicking desktop icons).
     pub kicked: Option<(Vec2, f32)>,
+    /// High-fived this stickman.
+    pub high_five: Option<u32>,
 }
 
 pub struct Stickman {
@@ -212,6 +216,8 @@ pub struct Stickman {
     stomp_target: Option<(Vec2, WinId)>,
     /// Flying without bumping into windows (heroic leaps to help in games).
     ghost: bool,
+    /// A feeling showing as body language, and seconds left.
+    expression: Option<(Feeling, f32)>,
     pub rig: Rig,
 }
 
@@ -291,6 +297,7 @@ impl Stickman {
             wobble: 0.0,
             stomp_target: None,
             ghost: false,
+            expression: None,
             rig: Rig::new(),
         }
     }
@@ -342,6 +349,9 @@ impl Stickman {
                 allow_cursor: self.allow_cursor,
                 move_icons: self.move_icons,
                 peers,
+                shaky: (self.support_vel.len() / (600.0 * self.d.s)).min(1.0),
+                height: 0.0,
+                attention: 0.0,
             }),
             _ => None,
         }
@@ -491,6 +501,28 @@ impl Stickman {
 
     pub fn is_squashed(&self) -> bool {
         self.squash.is_some()
+    }
+
+    /// Show a feeling with body language for a moment.
+    pub fn express(&mut self, f: Feeling) {
+        self.expression = Some((f, f.secs()));
+        if f == Feeling::Startled && self.ragdoll.is_none() {
+            self.rig.jolt(260.0 * self.d.s);
+        }
+    }
+
+    /// Standing on its feet, not busy with anything that can't be cut short
+    /// (so another stickman's high-five can get an answer).
+    pub fn is_free(&self) -> bool {
+        matches!(self.mode, Mode::Ground(_))
+            && !matches!(
+                self.action,
+                Some(Action::JumpPrep { .. })
+                    | Some(Action::Punch { .. })
+                    | Some(Action::Kick { .. })
+                    | Some(Action::ClimbApproach { .. })
+                    | Some(Action::PortalApproach { .. })
+            )
     }
 
     // ---------- outside influences ----------
@@ -679,7 +711,7 @@ impl Stickman {
         // Too hurt for anything acrobatic: rest instead.
         let allowed = match intent {
             Intent::Idle { .. } | Intent::Walk { .. } | Intent::Sit { .. } => true,
-            Intent::Pose { gesture: Gesture::Sleep, .. } => true,
+            Intent::Pose { gesture: Gesture::Sleep, .. } | Intent::HighFive { .. } => true,
             _ if self.health < WEAK => false,
             Intent::Pose { gesture: Gesture::PushUp, .. }
             | Intent::Flip
@@ -774,6 +806,10 @@ impl Stickman {
                 self.facing = dir;
                 Action::Punch { t: 0.0, target, dir, fired: false, soft: true }
             }
+            Intent::HighFive { target, dir } => {
+                self.facing = dir;
+                Action::HighFive { t: 0.0, target, dir, fired: false }
+            }
             Intent::ToggleLayer => {
                 if !self.force_front {
                     self.layer = match self.layer {
@@ -795,6 +831,9 @@ impl Stickman {
         let heal = if self.sleeping { HEAL_ASLEEP } else { HEAL };
         self.health = (self.health + heal * dt).min(1.0);
         self.sleeping = false;
+        if let Some((f, left)) = self.expression {
+            self.expression = (left > dt).then_some((f, left - dt));
+        }
         self.cursor = cursor;
         self.cursor_vel = cursor_vel;
         let mut ev = Events::default();
@@ -1255,6 +1294,17 @@ impl Stickman {
                     }
                     (t < 0.5).then_some(Action::Kick { t, target, dir, fired })
                 }
+                Action::HighFive { t, target, dir, fired } => {
+                    let t = t + dt;
+                    gesture = Gesture::HighFive((t / 0.25).min(1.0));
+                    self.facing = dir;
+                    let mut fired = fired;
+                    if t >= 0.25 && !fired {
+                        fired = true;
+                        ev.high_five = Some(target);
+                    }
+                    (t < 0.7).then_some(Action::HighFive { t, target, dir, fired })
+                }
                 Action::PlayDead(t) => {
                     gesture = Gesture::Sleep;
                     // Your cursor comes close: BOO, it leaps up.
@@ -1437,6 +1487,13 @@ impl Stickman {
         // Walked off the edge of a window.
         if !surf.walled && (self.pos.x < surf.x0 - 3.0 * s || self.pos.x > surf.x1 + 3.0 * s) {
             self.start_fall();
+        }
+        // A feeling shows through whatever it's doing, unless its body is
+        // busy with something else.
+        if let Some((f, _)) = self.expression {
+            if !sit && matches!(gesture, Gesture::None | Gesture::Wave | Gesture::TapFoot) {
+                gesture = f.gesture();
+            }
         }
         // Sitting / lying poses take priority over crawling.
         if sit || gesture.is_low() {

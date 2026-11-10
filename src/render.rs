@@ -115,3 +115,38 @@ pub fn draw(pm: &mut Pixmap, pose: &Pose, origin: Vec2, d: &Dims, style: &Style,
         draw_zzz(pm, p(head), time, d, style);
     }
 }
+
+/// A little stickman waving, for the tray icon (straight RGBA, not
+/// premultiplied).
+pub fn icon(size: u32, color: [u8; 3]) -> Option<Pixmap> {
+    let mut pm = Pixmap::new(size, size)?;
+    let k = size as f32;
+    let at = |x: f32, y: f32| v2(x * k, y * k);
+    let style = Style::new(color, true);
+    let outline = style.outline.unwrap_or([240, 240, 240, 220]);
+    let w = k * 0.095;
+    let parts: [&[Vec2]; 4] = [
+        &[at(0.5, 0.36), at(0.5, 0.64)],
+        &[at(0.5, 0.42), at(0.3, 0.6)],
+        &[at(0.5, 0.42), at(0.72, 0.3), at(0.78, 0.12)],
+        &[at(0.32, 0.94), at(0.5, 0.64), at(0.68, 0.94)],
+    ];
+    for pts in parts {
+        polyline(&mut pm, pts, w + k * 0.07, outline);
+    }
+    circle(&mut pm, at(0.5, 0.2), k * 0.15 + k * 0.035, outline);
+    for pts in parts {
+        polyline(&mut pm, pts, w, style.body);
+    }
+    circle(&mut pm, at(0.5, 0.2), k * 0.15, style.body);
+    // tiny-skia stores premultiplied colour; icons want it straight.
+    for px in pm.data_mut().chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Some(pm)
+}

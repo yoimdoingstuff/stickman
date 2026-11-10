@@ -85,6 +85,23 @@ pub struct Page {
     pub win: WinId,
     pub doc: Rect,
     pub ledges: Vec<Rect>,
+    /// When the boxes were read.
+    pub taken: std::time::Instant,
+    /// The followed box's top that `ledges` currently line up with
+    /// (which tracking, top). Live readings move the ledges by the difference.
+    pub probe: Option<(u32, f32)>,
+    /// How far the ledges have been moved since they were read.
+    pub shift: f32,
+}
+
+impl Page {
+    pub fn scroll_by(&mut self, dy: f32) {
+        for r in &mut self.ledges {
+            r.t += dy;
+            r.b += dy;
+        }
+        self.shift += dy;
+    }
 }
 
 /// Same-shaped boxes keep their key when the page scrolls (only y changes).
@@ -310,7 +327,7 @@ impl World {
 
     /// The page ledge with this key, the one nearest to `near_y` if several
     /// boxes share a shape (list items, etc.).
-    fn ledge(&self, win: WinId, key: u32, near_y: Option<f32>) -> Option<Rect> {
+    pub fn ledge(&self, win: WinId, key: u32, near_y: Option<f32>) -> Option<Rect> {
         let page = self.pages.iter().find(|p| p.win == win)?;
         let mut best: Option<Rect> = None;
         for r in page.ledges.iter().filter(|r| ledge_key(r) == key) {
@@ -584,7 +601,14 @@ mod tests {
             taskbar: None,
             doors: Vec::new(),
             peers: Vec::new(),
-            pages: vec![Page { win: 7, doc: r(100.0, 180.0, 1100.0, 900.0), ledges: vec![r(200.0, 400.0, 500.0, 440.0)] }],
+            pages: vec![Page {
+                win: 7,
+                doc: r(100.0, 180.0, 1100.0, 900.0),
+                ledges: vec![r(200.0, 400.0, 500.0, 440.0)],
+                taken: std::time::Instant::now(),
+                probe: None,
+                shift: 0.0,
+            }],
             icons: vec![(icon_key("Recycle Bin"), r(20.0, 200.0, 95.0, 270.0))],
         };
         // Icons are walkable from the desktop, not from inside the browser.
